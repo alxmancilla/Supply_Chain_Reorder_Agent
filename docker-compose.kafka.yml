@@ -1,0 +1,112 @@
+# ── Standalone Kafka (KRaft — no ZooKeeper) ─────────────────────────────────
+#
+# Two ways to use this file:
+#
+#   A) Standalone Kafka only (then run the main stack separately):
+#        docker compose -f docker-compose.kafka.yml up -d
+#
+#   B) Full stack in Kafka mode (Kafka + agent + app, no simulator):
+#        docker compose -f docker-compose.yml -f docker-compose.kafka.yml \
+#          --profile kafka up --build
+#
+# External access for Atlas Stream Processing
+# ───────────────────────────────────────────
+# Port 9094 is advertised with HOST_IP so Atlas ASP (and local tools like
+# kafka/producer.py) can reach the broker from outside the Docker network.
+# Set HOST_IP to your machine's public IP before starting:
+#
+#   export HOST_IP=$(curl -s ifconfig.me)
+#   docker compose -f docker-compose.kafka.yml up -d
+#
+# If HOST_IP is not set, it defaults to "localhost" (local testing only).
+# ---------------------------------------------------------------------------
+
+services:
+
+  # ── Kafka broker (KRaft, single-node) ─────────────────────────────────────
+  kafka:
+    image: bitnami/kafka:3.7
+    container_name: kafka
+    profiles: [kafka]
+    ports:
+      - "9092:9092"   # INTERNAL — container-to-container (kafka-consumer service)
+      - "9094:9094"   # EXTERNAL — Atlas Stream Processing + local tools
+    environment:
+      # KRaft identity
+      KAFKA_CFG_NODE_ID: 1
+      KAFKA_CFG_PROCESS_ROLES: broker,controller
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+
+      # Three listeners:
+      #   INTERNAL   → container network (kafka-consumer, kafka-init)
+      #   EXTERNAL   → public access (ASP, producer.py on host)
+      #   CONTROLLER → KRaft consensus (internal only)
+      KAFKA_CFG_LISTENERS: >-
+        INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:9094,CONTROLLER://0.0.0.0:9093
+      KAFKA_CFG_ADVERTISED_LISTENERS: >-
+        INTERNAL://kafka:9092,EXTERNAL://${HOST_IP:-localhost}:9094
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: >-
+        INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CFG_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "false"
+      ALLOW_PLAINTEXT_LISTENER: "yes"
+
+      # Retention: keep events for 7 days, max 1 GB per partition
+      KAFKA_CFG_LOG_RETENTION_HOURS: 168
+      KAFKA_CFG_LOG_RETENTION_BYTES: 1073741824
+
+    volumes:
+      - kafka-data:/bitnami/kafka
+    healthcheck:
+      test: ["CMD", "kafka-topics.sh", "--bootstrap-server", "kafka:9092", "--list"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 20s
+
+  # ── Topic initialiser ──────────────────────────────────────────────────────
+  # Runs once after Kafka is healthy; creates wms-inventory-events then exits.
+  kafka-init:
+    image: bitnami/kafka:3.7
+    container_name: kafka-init
+    profiles: [kafka]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: "no"
+    command: >
+      bash -c "
+        echo 'Creating topic wms-inventory-events ...' &&
+        kafka-topics.sh --create --if-not-exists
+          --bootstrap-server kafka:9092
+          --topic wms-inventory-events
+          --partitions 3
+          --replication-factor 1 &&
+        echo 'Done.' &&
+        kafka-topics.sh --bootstrap-server kafka:9092
+          --describe --topic wms-inventory-events
+      "
+
+  # ── Kafka consumer (bridge: Kafka → MongoDB reorder_alerts) ───────────────
+  # Reads consumption events from wms-inventory-events and applies the same
+  # check-and-alert logic as stream_simulator.py.
+  # Only active in kafka profile: docker compose --profile kafka up
+  kafka-consumer:
+    build: .
+    container_name: kafka-consumer
+    profiles: [kafka]
+    command: python kafka/consumer.py
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      PYTHONUNBUFFERED: "1"
+      KAFKA_BROKER: kafka:9092      # internal listener — same Docker network
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+
+volumes:
+  kafka-data:
+    driver: local

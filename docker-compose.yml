@@ -1,0 +1,152 @@
+# ── Reorder Alert Agent — Docker Compose ───────────────────────────────────
+#
+# EVENT SOURCE — two modes:
+#
+#   Simulator mode (default — no Kafka required):
+#     docker compose up --build
+#
+#   Kafka mode (adds local Kafka broker + consumer; stop simulator via dashboard first):
+#     export HOST_IP=$(curl -s ifconfig.me)   # public IP for Atlas ASP access
+#     docker compose --profile kafka up --build
+#
+# Services:
+#   (always)  seeder → agent → simulator → app
+#   kafka     Kafka broker + kafka-init + kafka-consumer (opt-in via --profile kafka)
+#
+# Secrets are loaded from the .env file in the project root.
+# ---------------------------------------------------------------------------
+
+x-common: &common
+  build: .
+  env_file: .env
+  environment:
+    # Disable Python's stdout/stderr buffering so print() output appears
+    # immediately in `docker compose logs` instead of being held in memory.
+    PYTHONUNBUFFERED: "1"
+  # Never restart the seeder; let long-running services restart on failure
+  restart: "no"
+
+services:
+
+  # ── Seed script ────────────────────────────────────────────────────────
+  # Runs once: populates inventory, suppliers, consumption history, order
+  # history (with Voyage AI embeddings), and creates/refreshes Atlas Search
+  # and Vector Search indexes.  Exits 0 on success.
+  seeder:
+    <<: *common
+    command: python data/seed.py
+
+  # ── LangGraph agent ────────────────────────────────────────────────────
+  # Watches reorder_alerts via MongoDB Change Stream; for each new alert it
+  # runs the assess → gather → reason → save graph and writes a proposed order.
+  agent:
+    <<: *common
+    command: python agent/graph.py
+    restart: unless-stopped
+    depends_on:
+      seeder:
+        condition: service_completed_successfully
+
+  # ── Stream simulator ───────────────────────────────────────────────────
+  # Picks a random SKU every 10 s, simulates consumption, and writes a
+  # reorder_alert when stock drops below the reorder point.
+  # Runs by default. Pause or stop it via the dashboard control panel
+  # before switching to Kafka mode.
+  simulator:
+    <<: *common
+    command: python simulator/stream_simulator.py
+    restart: unless-stopped
+    depends_on:
+      seeder:
+        condition: service_completed_successfully
+
+  # ── Kafka broker (KRaft — no ZooKeeper) ────────────────────────────────
+  # Active only in kafka mode: docker compose --profile kafka up
+  # HOST_IP must be set to your public IP so Atlas ASP can reach port 9094.
+  kafka:
+    image: bitnami/kafka:3.7
+    container_name: kafka
+    profiles: [kafka]
+    ports:
+      - "9092:9092"   # INTERNAL — container network
+      - "9094:9094"   # EXTERNAL — Atlas Stream Processing + local tools
+    environment:
+      KAFKA_CFG_NODE_ID: 1
+      KAFKA_CFG_PROCESS_ROLES: broker,controller
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CFG_LISTENERS: >-
+        INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:9094,CONTROLLER://0.0.0.0:9093
+      KAFKA_CFG_ADVERTISED_LISTENERS: >-
+        INTERNAL://kafka:9092,EXTERNAL://${HOST_IP:-localhost}:9094
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: >-
+        INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CFG_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "false"
+      ALLOW_PLAINTEXT_LISTENER: "yes"
+    volumes:
+      - kafka-data:/bitnami/kafka
+    healthcheck:
+      test: ["CMD", "kafka-topics.sh", "--bootstrap-server", "kafka:9092", "--list"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 20s
+
+  # ── Topic initialiser ──────────────────────────────────────────────────
+  kafka-init:
+    image: bitnami/kafka:3.7
+    container_name: kafka-init
+    profiles: [kafka]
+    restart: "no"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command: >
+      bash -c "
+        kafka-topics.sh --create --if-not-exists
+          --bootstrap-server kafka:9092
+          --topic wms-inventory-events
+          --partitions 3
+          --replication-factor 1 &&
+        echo 'Topic wms-inventory-events ready.'
+      "
+
+  # ── Kafka consumer (bridge: Kafka → MongoDB reorder_alerts) ────────────
+  # Reads from wms-inventory-events; applies the same check-and-alert logic
+  # as the simulator.  Send test events with: python kafka/producer.py
+  kafka-consumer:
+    <<: *common
+    command: python kafka/consumer.py
+    restart: unless-stopped
+    profiles: [kafka]
+    environment:
+      PYTHONUNBUFFERED: "1"
+      KAFKA_BROKER: kafka:9092
+    depends_on:
+      seeder:
+        condition: service_completed_successfully
+      kafka-init:
+        condition: service_completed_successfully
+
+  # ── Streamlit dashboard ────────────────────────────────────────────────
+  # Single-page dashboard: live inventory, active alerts, agent decisions.
+  # Open http://localhost:8501 in your browser.
+  app:
+    <<: *common
+    command: >
+      streamlit run app.py
+      --server.port=8501
+      --server.address=0.0.0.0
+      --server.headless=true
+      --browser.gatherUsageStats=false
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    depends_on:
+      seeder:
+        condition: service_completed_successfully
+
+volumes:
+  kafka-data:
+    driver: local

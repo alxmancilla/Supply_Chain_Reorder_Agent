@@ -1,0 +1,652 @@
+"""
+Streamlit dashboard — WMS-style operations view, auto-refreshes every 5 seconds.
+
+Layout:
+  Top bar  — brand, nav tabs, live indicator
+  KPI row  — 4 summary cards (below-reorder, alerts, auto-approved, awaiting)
+  Left panel  — inventory grid (SKU cards with stock-level bars)
+  Right panel — active alerts + agent decisions (severity-badged cards)
+"""
+
+import os
+import threading
+import time
+from datetime import datetime, timezone
+
+import streamlit as st
+from dotenv import load_dotenv
+from streamlit_autorefresh import st_autorefresh
+from pymongo import MongoClient
+
+from agent.tools import write_human_decision_memory
+
+load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Page config
+# ---------------------------------------------------------------------------
+st.set_page_config(
+    page_title="Reorder Alert Agent",
+    page_icon="🏥",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ---------------------------------------------------------------------------
+# MongoDB connection
+# ---------------------------------------------------------------------------
+@st.cache_resource
+def get_db():
+    c = MongoClient(
+        os.environ["MONGODB_URI"],
+        serverSelectionTimeoutMS=5_000,
+        connectTimeoutMS=10_000,
+        socketTimeoutMS=30_000,
+    )
+    return c["supply_chain_demo"]
+
+
+db = get_db()
+
+# ---------------------------------------------------------------------------
+# Auto-refresh interval
+# ---------------------------------------------------------------------------
+REFRESH_INTERVAL = 5  # seconds
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _ago(dt) -> str:
+    """Return a human-readable 'Xs/Xm/Xh ago' string for a UTC datetime."""
+    if not dt:
+        return "?"
+    try:
+        d    = dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        secs = max(0, int((datetime.now(timezone.utc) - d).total_seconds()))
+        if secs < 60:
+            return f"{secs}s ago"
+        if secs < 3600:
+            return f"{secs // 60}m ago"
+        return f"{secs // 3600}h ago"
+    except Exception:
+        return "?"
+
+# ---------------------------------------------------------------------------
+# CSS — Professional WMS-style theme
+# ---------------------------------------------------------------------------
+st.markdown("""
+<style>
+[data-testid="block-container"] { padding-top: 0.75rem; }
+
+/* Top bar */
+.top-bar {
+    background: linear-gradient(135deg, #1a1f2e 0%, #2d3748 100%);
+    border-radius: 10px; padding: 14px 20px; margin-bottom: 14px;
+    display: flex; align-items: center; justify-content: space-between;
+}
+.top-bar h1 { color: #fff; font-size: 1.25rem; font-weight: 700; margin: 0; display: inline; }
+.tech-pill {
+    display: inline-block; font-size: 0.6rem; font-weight: 700;
+    padding: 2px 8px; border-radius: 20px; margin-left: 6px;
+    background: #4a5568; color: #e2e8f0;
+}
+.tech-pill.mongo { background: #00684a; color: #00ed64; }
+.live-indicator { color: #a0aec0; font-size: 0.78rem; text-align: right; line-height: 1.6; }
+.live-dot {
+    display: inline-block; width: 8px; height: 8px;
+    background: #00ed64; border-radius: 50%; margin-right: 5px;
+    animation: blink 1.8s ease-in-out infinite;
+}
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
+
+/* KPI row */
+.kpi-row { display: flex; gap: 10px; margin-bottom: 16px; }
+.kpi-card {
+    flex: 1; background: #fff; border-radius: 10px;
+    padding: 14px 18px; box-shadow: 0 1px 4px rgba(0,0,0,.07);
+    border-top: 3px solid #e2e8f0;
+}
+.kpi-card.red   { border-top-color: #e53e3e; }
+.kpi-card.amber { border-top-color: #d69e2e; }
+.kpi-card.green { border-top-color: #38a169; }
+.kpi-card.blue  { border-top-color: #3182ce; }
+.kpi-lbl { font-size: 0.7rem; font-weight: 600; color: #718096; text-transform: uppercase; letter-spacing:.06em; }
+.kpi-val { font-size: 1.9rem; font-weight: 800; color: #1a202c; line-height: 1.15; }
+.kpi-sub { font-size: 0.7rem; color: #a0aec0; }
+
+/* Panel headings */
+.panel-hdr {
+    font-size: 0.72rem; font-weight: 700; color: #4a5568;
+    text-transform: uppercase; letter-spacing: .08em;
+    padding-bottom: 6px; border-bottom: 2px solid #e2e8f0; margin-bottom: 10px;
+}
+
+/* Inventory cards */
+.inv-card {
+    background: #fff; border-radius: 10px; padding: 12px 14px;
+    margin-bottom: 10px; box-shadow: 0 1px 3px rgba(0,0,0,.06);
+    border-left: 4px solid #38a169;
+}
+.inv-card.crit { border-left-color: #e53e3e; }
+.inv-sku  { font-size: 0.7rem; font-weight: 700; color: #718096; }
+.inv-name { font-size: 0.86rem; font-weight: 600; color: #1a202c; line-height: 1.2; }
+.inv-loc  { font-size: 0.67rem; color: #a0aec0; margin-bottom: 6px; }
+.bar-bg   { background: #edf2f7; border-radius: 3px; height: 5px; margin: 6px 0 2px; }
+.bar-fill { height: 5px; border-radius: 3px; }
+.inv-nums { display: flex; gap: 10px; margin-top: 6px; flex-wrap: wrap; }
+.inv-n    { text-align: center; }
+.inv-nv   { font-size: 0.85rem; font-weight: 700; color: #2d3748; }
+.inv-nl   { font-size: 0.58rem; color: #a0aec0; text-transform: uppercase; }
+
+/* Feed cards (alerts + decisions) */
+.feed-card {
+    background: #fff; border-radius: 10px; padding: 12px 14px;
+    margin-bottom: 10px; box-shadow: 0 1px 3px rgba(0,0,0,.06);
+    border-left: 4px solid #e2e8f0;
+}
+.feed-card.crit   { border-left-color: #e53e3e; }
+.feed-card.high   { border-left-color: #dd6b20; }
+.feed-card.medium { border-left-color: #d69e2e; }
+.feed-card.ok     { border-left-color: #38a169; }
+.feed-hdr  { display: flex; justify-content: space-between; align-items: flex-start; }
+.feed-sku  { font-size: 0.88rem; font-weight: 700; color: #1a202c; }
+.feed-loc  { font-size: 0.72rem; color: #718096; }
+.feed-age  { font-size: 0.68rem; color: #a0aec0; white-space: nowrap; }
+.feed-nums { display: flex; gap: 14px; margin-top: 8px; flex-wrap: wrap; }
+.feed-nv   { font-size: 0.88rem; font-weight: 700; color: #2d3748; }
+.feed-nl   { font-size: 0.62rem; color: #a0aec0; text-transform: uppercase; }
+
+/* Badges */
+.badge {
+    display: inline-block; font-size: 0.58rem; font-weight: 700;
+    padding: 2px 6px; border-radius: 20px; margin-right: 3px;
+    text-transform: uppercase; letter-spacing: .04em;
+}
+.b-crit   { background:#fed7d7; color:#9b2c2c; }
+.b-high   { background:#feebc8; color:#7b341e; }
+.b-med    { background:#fefcbf; color:#744210; }
+.b-ok     { background:#c6f6d5; color:#22543d; }
+.b-info   { background:#bee3f8; color:#2a4365; }
+.b-purple { background:#e9d8fd; color:#44337a; }
+</style>
+""", unsafe_allow_html=True)
+
+# ---------------------------------------------------------------------------
+# Sidebar — Simulator controls + Atlas Search: supplier capability search
+# ---------------------------------------------------------------------------
+with st.sidebar:
+
+    # ── Simulator Controls ────────────────────────────────────────────────
+    st.subheader("⚙️ Simulator Controls")
+
+    ctrl_doc  = db.simulator_control.find_one({"_id": "main"})
+    sim_state = ctrl_doc.get("state", "stopped") if ctrl_doc else "stopped"
+    sim_speed = int(ctrl_doc.get("speed", 1)) if ctrl_doc else 1
+
+    badge = {"running": "🟢 Running", "paused": "🟡 Paused", "stopped": "🔴 Stopped"}
+    st.caption(f"Status: **{badge.get(sim_state, '❓ Unknown')}**")
+
+    sc1, sc2, sc3 = st.columns(3)
+    if sc1.button("▶ Start", disabled=(sim_state == "running"), use_container_width=True):
+        db.simulator_control.update_one(
+            {"_id": "main"}, {"$set": {"state": "running"}}, upsert=True
+        )
+        st.rerun()
+    if sc2.button("⏸ Pause", disabled=(sim_state != "running"), use_container_width=True):
+        db.simulator_control.update_one(
+            {"_id": "main"}, {"$set": {"state": "paused"}}, upsert=True
+        )
+        st.rerun()
+    if sc3.button("⏹ Stop", disabled=(sim_state == "stopped"), use_container_width=True):
+        db.simulator_control.update_one(
+            {"_id": "main"}, {"$set": {"state": "stopped"}}, upsert=True
+        )
+        st.rerun()
+
+    # ── Drain speed slider ────────────────────────────────────────────────
+    new_speed = st.select_slider(
+        "⚡ Drain Speed",
+        options=[1, 2, 3, 5, 10],
+        value=sim_speed,
+        format_func=lambda v: {1: "1× Normal", 2: "2× Fast", 3: "3× Faster",
+                               5: "5× Demo", 10: "10× Chaos"}.get(v, f"{v}×"),
+        help="Multiplies units consumed per tick — higher = alerts fire faster",
+    )
+    if new_speed != sim_speed:
+        db.simulator_control.update_one(
+            {"_id": "main"}, {"$set": {"speed": new_speed}}, upsert=True
+        )
+
+    st.divider()
+    st.header("🔍 Supplier Search")
+    st.caption("Powered by **Atlas Search** — full-text across supplier capability notes")
+
+    # ── Use st.form so the auto-refresh (st.rerun every 10 s) cannot clear ──
+    # the user's mid-type input.  Form widgets buffer their state and only      ──
+    # fire when the submit button is clicked or Enter is pressed.              ──
+    if "supplier_search_query" not in st.session_state:
+        st.session_state.supplier_search_query = ""
+
+    with st.form("supplier_search_form", clear_on_submit=False):
+        raw_query = st.text_input(
+            "Search supplier capabilities",
+            value=st.session_state.supplier_search_query,
+            placeholder="e.g. cold chain insulin, expedited PPE, emergency antibiotics",
+        )
+        col_btn, col_clr = st.columns([3, 1])
+        submitted = col_btn.form_submit_button("🔍 Search", use_container_width=True)
+        cleared   = col_clr.form_submit_button("✕ Clear",  use_container_width=True)
+
+    if submitted and raw_query.strip():
+        st.session_state.supplier_search_query = raw_query.strip()
+    if cleared:
+        st.session_state.supplier_search_query = ""
+
+    search_query = st.session_state.supplier_search_query
+
+    if search_query:
+        # ── Primary: Atlas Search (full-text + fuzzy) ────────────────────
+        atlas_results = []
+        atlas_error   = None
+        try:
+            pipeline = [
+                {
+                    "$search": {
+                        "index": "suppliers_text_search",
+                        "compound": {
+                            "should": [
+                                {
+                                    "text": {
+                                        "query": search_query,
+                                        "path":  "supplier_name",
+                                        "score": {"boost": {"value": 3}},
+                                    }
+                                },
+                                {
+                                    "text": {
+                                        "query": search_query,
+                                        "path":  "notes",
+                                        "fuzzy": {"maxEdits": 1},
+                                    }
+                                },
+                            ]
+                        },
+                    }
+                },
+                {"$addFields": {"score": {"$meta": "searchScore"}}},
+                {
+                    "$project": {
+                        "_id": 0, "supplier_name": 1, "supplier_id": 1,
+                        "sku": 1, "lead_time_days": 1, "fill_rate_pct": 1,
+                        "unit_price": 1, "notes": 1, "score": 1,
+                    }
+                },
+                {"$limit": 8},
+            ]
+            atlas_results = list(db.suppliers.aggregate(pipeline))
+        except Exception as exc:
+            atlas_error = exc
+
+        # ── Fallback: regex search when Atlas Search errors or returns nothing ──
+        if atlas_error or not atlas_results:
+            terms = search_query.split()
+            regex_pat = "|".join(terms)
+            fallback = list(db.suppliers.find(
+                {"$or": [
+                    {"supplier_name": {"$regex": regex_pat, "$options": "i"}},
+                    {"notes":         {"$regex": regex_pat, "$options": "i"}},
+                ]},
+                {"_id": 0, "supplier_name": 1, "supplier_id": 1, "sku": 1,
+                 "lead_time_days": 1, "fill_rate_pct": 1, "unit_price": 1, "notes": 1},
+            ).limit(8))
+            # Attach a dummy score so the display loop is uniform
+            results  = [dict(r, score=None) for r in fallback]
+            src_label = "🔄 Regex fallback"
+            if atlas_error:
+                st.warning(f"Atlas Search unavailable — showing regex results.\n\n`{atlas_error}`")
+        else:
+            results   = atlas_results
+            src_label = "🔍 Atlas Search"
+
+        if results:
+            st.success(f"{len(results)} supplier(s) matched  ·  {src_label}")
+            for r in results:
+                with st.container(border=True):
+                    rc1, rc2 = st.columns([3, 1])
+                    rc1.markdown(f"**{r['supplier_name']}**")
+                    rc2.markdown(f"`{r['sku']}`")
+                    st.caption(
+                        f"Lead {r['lead_time_days']}d · "
+                        f"Fill {r['fill_rate_pct']}% · "
+                        f"${r['unit_price']:.2f}/unit"
+                    )
+                    if r["score"] is not None:
+                        st.progress(
+                            min(r["score"] / 3.0, 1.0),
+                            text=f"Relevance score: {r['score']:.3f}",
+                        )
+                    with st.expander("Capability notes"):
+                        st.write(r.get("notes", "No notes available."))
+        else:
+            st.info("No suppliers matched. Try broader terms.")
+    else:
+        st.info("Type a capability and press **Search** (or Enter).")
+
+    st.divider()
+    st.caption("Atlas Search index: `suppliers_text_search`")
+    st.caption("Atlas Vector Search index: `order_history_vector_index`")
+
+    # ── Demo Status ───────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("📊 Demo Status")
+    _last_alert = db.reorder_alerts.find_one(sort=[("created_at", -1)])
+    _last_order = db.proposed_orders.find_one(sort=[("created_at", -1)])
+    _total      = db.proposed_orders.count_documents({})
+    _auto       = db.proposed_orders.count_documents({"auto_approved": True})
+    _mems       = db.agent_memory.count_documents({})
+
+    sc1, sc2 = st.columns(2)
+    sc1.metric("Last Alert",    _ago(_last_alert.get("created_at")) if _last_alert else "—")
+    sc2.metric("Last Decision", _ago(_last_order.get("created_at")) if _last_order else "—")
+
+    sd1, sd2 = st.columns(2)
+    sd1.metric("Total Decisions", _total)
+    sd2.metric("Auto-Approved",   f"{_auto} ({int(_auto / max(_total, 1) * 100)}%)")
+
+    st.metric("Long-term Memories", _mems)
+
+    # ── Reset Demo ────────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("🔄 Reset Demo")
+    st.caption("Clears alerts, orders, memory and checkpoints. Inventory and suppliers are kept.")
+    if st.button("🔄 Reset Demo", type="primary", use_container_width=True):
+        # Clear all operational collections
+        db.reorder_alerts.drop()
+        db.reorder_alerts.create_index([("status", 1)])
+        db.reorder_alerts.create_index([("sku", 1), ("created_at", 1)])
+        db.reorder_alerts.create_index([("status", 1), ("created_at", 1)])
+        db.proposed_orders.drop()
+        db.proposed_orders.create_index([("status", 1)])
+        db.proposed_orders.create_index([("alert_id", 1)])
+        db.proposed_orders.create_index([("sku", 1), ("location", 1), ("status", 1)])
+        db.proposed_orders.create_index([("created_at", 1)])
+        db.short_term_memory.drop()
+        db.agent_memory.drop()
+        db.checkpoints.drop()
+        db.checkpoint_writes.drop()
+        # Clear the Change Stream resume token — the reorder_alerts collection
+        # is being dropped, so the saved token is now invalid.  The agent will
+        # re-open a fresh stream from the current head on its next reconnect.
+        db.agent_state.delete_one({"_id": "change_stream_resume_token"})
+        # Reset on_order counters so inventory shows clean state
+        db.inventory.update_many({}, {"$set": {"on_order": 0}})
+        # Reset simulator to running at normal speed
+        db.simulator_control.update_one(
+            {"_id": "main"}, {"$set": {"state": "running", "speed": 1}}, upsert=True
+        )
+        st.success("✅ Demo reset! Collections cleared — simulator restarted at 1× speed.")
+        st.rerun()
+
+# ---------------------------------------------------------------------------
+# Data fetching
+# ---------------------------------------------------------------------------
+inventory_docs = list(db.inventory.find({}, {"_id": 0}).sort("sku", 1))
+inventory_docs.sort(key=lambda x: (0 if x["on_hand"] < x["reorder_point"] else 1, x["sku"]))
+
+alert_docs = list(db.reorder_alerts.find({"status": "pending"}).sort("created_at", -1).limit(20))
+order_docs = list(db.proposed_orders.find({}).sort("created_at", -1).limit(20))
+order_docs.sort(key=lambda o: (
+    {"awaiting_approval": 0, "approved": 1, "rejected": 2}.get(o.get("status"), 1),
+    -(o["created_at"].timestamp() if hasattr(o.get("created_at"), "timestamp") else 0),
+))
+
+# KPI aggregates — single $facet round-trip instead of multiple count_documents
+below_reorder  = sum(1 for i in inventory_docs if i["on_hand"] < i["reorder_point"])
+awaiting_count = sum(1 for o in order_docs if o.get("status") == "awaiting_approval")
+
+_order_kpis = list(db.proposed_orders.aggregate([
+    {"$facet": {
+        "total":     [{"$count": "n"}],
+        "auto":      [{"$match": {"auto_approved": True}}, {"$count": "n"}],
+    }}
+]))
+_total_orders = _order_kpis[0]["total"][0]["n"]  if _order_kpis and _order_kpis[0]["total"]  else 0
+_total_auto   = _order_kpis[0]["auto"][0]["n"]   if _order_kpis and _order_kpis[0]["auto"]   else 0
+mem_count     = db.agent_memory.count_documents({})
+
+_kpi_below  = "red"   if below_reorder >= 4  else ("amber" if below_reorder >= 1 else "green")
+_kpi_alerts = "red"   if len(alert_docs) >= 5 else ("amber" if alert_docs else "green")
+_kpi_queue  = "amber" if awaiting_count >= 1  else "green"
+
+# ---------------------------------------------------------------------------
+# Top bar
+# ---------------------------------------------------------------------------
+st.markdown(f"""
+<div class="top-bar">
+  <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+    <span style="font-size:1.5rem">🏥</span>
+    <h1>Supply Chain Reorder Agent</h1>
+    <span class="tech-pill mongo">MongoDB Atlas</span>
+    <span class="tech-pill">LangGraph</span>
+    <span class="tech-pill">GPT-5.4</span>
+    <span class="tech-pill">Voyage AI</span>
+  </div>
+  <div class="live-indicator">
+    <span class="live-dot"></span><strong style="color:#e2e8f0">LIVE</strong>
+    &nbsp;·&nbsp; {time.strftime('%H:%M:%S')}<br>
+    Change Streams &nbsp;·&nbsp; Atlas Search &nbsp;·&nbsp; Vector Search
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+# ---------------------------------------------------------------------------
+# KPI row
+# ---------------------------------------------------------------------------
+st.markdown(f"""
+<div class="kpi-row">
+  <div class="kpi-card {_kpi_below}">
+    <div class="kpi-lbl">📦 Below Reorder</div>
+    <div class="kpi-val">{below_reorder}</div>
+    <div class="kpi-sub">of {len(inventory_docs)} monitored SKUs</div>
+  </div>
+  <div class="kpi-card {_kpi_alerts}">
+    <div class="kpi-lbl">🚨 Active Alerts</div>
+    <div class="kpi-val">{len(alert_docs)}</div>
+    <div class="kpi-sub">pending reorder events</div>
+  </div>
+  <div class="kpi-card {_kpi_queue}">
+    <div class="kpi-lbl">⏳ Approval Queue</div>
+    <div class="kpi-val">{awaiting_count}</div>
+    <div class="kpi-sub">orders awaiting review</div>
+  </div>
+  <div class="kpi-card blue">
+    <div class="kpi-lbl">⚡ Auto-Approved</div>
+    <div class="kpi-val">{_total_auto}</div>
+    <div class="kpi-sub">{int(_total_auto/max(_total_orders,1)*100)}% of {_total_orders} decisions · {mem_count} memories</div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+# ---------------------------------------------------------------------------
+# Main 2-panel layout
+# ---------------------------------------------------------------------------
+left_col, right_col = st.columns([1.1, 1])
+
+# ── Left panel: Inventory Grid ─────────────────────────────────────────────
+with left_col:
+    st.markdown('<div class="panel-hdr">📦 Live Inventory</div>', unsafe_allow_html=True)
+    if not inventory_docs:
+        st.info("No inventory data. Run `python data/seed.py` first.")
+    else:
+        for i in range(0, len(inventory_docs), 2):
+            row_items = inventory_docs[i:i + 2]
+            cols = st.columns(len(row_items))
+            for col, item in zip(cols, row_items):
+                with col:
+                    on_hand  = item["on_hand"]
+                    on_order = item.get("on_order", 0)
+                    reorder  = item["reorder_point"]
+                    below    = on_hand < reorder
+                    eff      = on_hand + on_order
+                    pct      = min(on_hand / max(reorder, 1), 1.0) * 100
+                    bar_clr  = "#e53e3e" if below else "#38a169"
+                    card_cls = "crit" if below else ""
+                    sbadge   = (
+                        '<span class="badge b-crit">CRITICAL</span>' if pct < 25
+                        else '<span class="badge b-high">LOW</span>' if below
+                        else '<span class="badge b-ok">OK</span>'
+                    )
+                    st.markdown(f"""
+<div class="inv-card {card_cls}">
+  <div style="display:flex;justify-content:space-between;align-items:center">
+    <span class="inv-sku">{item['sku']}</span>{sbadge}
+  </div>
+  <div class="inv-name">{item['name']}</div>
+  <div class="inv-loc">{item['location']} · {item['category']}</div>
+  <div class="bar-bg"><div class="bar-fill" style="width:{pct:.0f}%;background:{bar_clr}"></div></div>
+  <div style="font-size:0.62rem;color:#718096;margin-bottom:4px">{pct:.0f}% of reorder level</div>
+  <div class="inv-nums">
+    <div class="inv-n"><div class="inv-nv">{on_hand:,}</div><div class="inv-nl">On Hand</div></div>
+    <div class="inv-n"><div class="inv-nv" style="color:#3182ce">{on_order:,}</div><div class="inv-nl">On Order</div></div>
+    <div class="inv-n"><div class="inv-nv">{reorder:,}</div><div class="inv-nl">Reorder Pt</div></div>
+    <div class="inv-n"><div class="inv-nv" style="color:#805ad5">{eff:,}</div><div class="inv-nl">Effective</div></div>
+  </div>
+</div>""", unsafe_allow_html=True)
+
+# ── Right panel: Alerts + Decisions ───────────────────────────────────────
+with right_col:
+
+    # Active Alerts
+    st.markdown('<div class="panel-hdr">🚨 Active Alerts</div>', unsafe_allow_html=True)
+    if not alert_docs:
+        st.success("✅ No pending alerts — all stock levels OK.")
+    else:
+        for alert in alert_docs:
+            days = alert.get("days_of_stock_remaining", 0)
+            if days < 2:
+                sev_cls, sev_b = "crit",   '<span class="badge b-crit">CRITICAL</span>'
+            elif days < 7:
+                sev_cls, sev_b = "high",   '<span class="badge b-high">HIGH</span>'
+            else:
+                sev_cls, sev_b = "medium", '<span class="badge b-med">WATCH</span>'
+            has_order = any(str(o.get("alert_id")) == str(alert["_id"]) for o in order_docs)
+            agent_b   = (
+                '<span class="badge b-ok">ORDER DRAFTED</span>' if has_order
+                else '<span class="badge b-info">PROCESSING…</span>'
+            )
+            st.markdown(f"""
+<div class="feed-card {sev_cls}">
+  <div class="feed-hdr">
+    <div><span class="feed-sku">{alert['sku']}</span>
+    <span class="feed-loc"> @ {alert['location']}</span></div>
+    <span class="feed-age">{_ago(alert.get('created_at'))}</span>
+  </div>
+  <div style="margin:4px 0">{sev_b}{agent_b}</div>
+  <div class="feed-nums">
+    <div><div class="feed-nv">{alert['on_hand']:,}</div><div class="feed-nl">On Hand</div></div>
+    <div><div class="feed-nv">{float(days):.1f}d</div><div class="feed-nl">Days Left</div></div>
+    <div><div class="feed-nv">{alert['reorder_point']:,}</div><div class="feed-nl">Reorder Pt</div></div>
+    <div><div class="feed-nv">{alert['avg_daily_consumption']} u/d</div><div class="feed-nl">Avg Daily</div></div>
+  </div>
+</div>""", unsafe_allow_html=True)
+
+    # Agent Decisions
+    st.markdown('<div class="panel-hdr" style="margin-top:18px">🤖 Agent Decisions</div>',
+                unsafe_allow_html=True)
+    if not order_docs:
+        st.info("No proposed orders yet.")
+    else:
+        for order in order_docs:
+            status        = order.get("status", "awaiting_approval")
+            confidence    = order.get("confidence", "medium")
+            auto_approved = order.get("auto_approved", False)
+            used_search   = order.get("atlas_search_used", False)
+
+            conf_b   = {"high": '<span class="badge b-ok">HIGH</span>',
+                        "medium": '<span class="badge b-med">MEDIUM</span>',
+                        "low":    '<span class="badge b-crit">LOW</span>'}.get(confidence, "")
+            status_b = {"awaiting_approval": '<span class="badge b-info">AWAITING</span>',
+                        "approved":          '<span class="badge b-ok">APPROVED</span>',
+                        "rejected":          '<span class="badge b-crit">REJECTED</span>'}.get(status, "")
+            auto_b   = '<span class="badge b-purple">⚡ AUTO</span>'   if auto_approved else ""
+            srch_b   = '<span class="badge b-info">🔍 SEARCH</span>'  if used_search   else ""
+            card_cls = "ok" if status == "approved" else ("crit" if status == "rejected" else "medium")
+
+            with st.container():
+                st.markdown(f"""
+<div class="feed-card {card_cls}">
+  <div class="feed-hdr">
+    <div><span class="feed-sku">{order['sku']}</span>
+    <span class="feed-loc"> @ {order['location']}</span></div>
+    <span class="feed-age">{_ago(order.get('created_at'))}</span>
+  </div>
+  <div style="margin:4px 0">{conf_b}{status_b}{auto_b}{srch_b}</div>
+  <div class="feed-nums">
+    <div><div class="feed-nv">{order['quantity_recommended']:,}</div><div class="feed-nl">Qty</div></div>
+    <div><div class="feed-nv">${order['total_cost']:,.0f}</div><div class="feed-nl">Cost</div></div>
+    <div><div class="feed-nv">{order['expected_delivery_days']}d</div><div class="feed-nl">Lead</div></div>
+    <div style="flex:2"><div class="feed-nv" style="font-size:0.78rem">{order['supplier_name']}</div><div class="feed-nl">Supplier</div></div>
+  </div>
+</div>""", unsafe_allow_html=True)
+
+                similar = [s for s in order.get("similar_orders", [])
+                           if "error" not in s and "info" not in s]
+                with st.expander("💬 Rationale  /  🧠 Vector Search", expanded=False):
+                    st.write(order.get("rationale", "N/A"))
+                    if similar:
+                        st.caption(f"🧠 {len(similar)} similar past order(s) via Vector Search")
+                        for s in similar:
+                            st.markdown(
+                                f"**{s['sku']}** @ {s.get('location','?')} · "
+                                f"{s.get('days_of_stock_at_order','?')}d remaining · "
+                                f"trend: *{s.get('trend_at_order','?')}* · "
+                                f"outcome: **{s.get('outcome','?')}** · "
+                                f"score: `{s.get('similarity_score',0):.3f}`"
+                            )
+
+                if status == "awaiting_approval":
+                    btn1, btn2 = st.columns(2)
+                    oid = order["_id"]
+                    if btn1.button("✅ Approve", key=f"approve_{oid}", use_container_width=True):
+                        db.proposed_orders.update_one({"_id": oid}, {"$set": {"status": "approved"}})
+                        db.inventory.update_one(
+                            {"sku": order["sku"], "location": order["location"]},
+                            {"$inc": {"on_order": order["quantity_recommended"]}},
+                        )
+                        # Record the human approval in both memory layers.
+                        # Runs in a background thread so the UI reruns immediately
+                        # without waiting for the Voyage AI embedding call.
+                        threading.Thread(
+                            target=write_human_decision_memory,
+                            args=(dict(order), "approved"),
+                            daemon=True,
+                        ).start()
+                        st.rerun()
+                    if btn2.button("❌ Reject", key=f"reject_{oid}", use_container_width=True):
+                        db.proposed_orders.update_one({"_id": oid}, {"$set": {"status": "rejected"}})
+                        alert_id = order.get("alert_id")
+                        if alert_id:
+                            db.reorder_alerts.update_one(
+                                {"_id": alert_id},
+                                {"$set": {"status": "pending"}, "$unset": {"order_id": ""}},
+                            )
+                        # Record the human rejection in both memory layers.
+                        # The agent will re-process this alert via Change Stream
+                        # and will now see the rejection in short-term memory.
+                        threading.Thread(
+                            target=write_human_decision_memory,
+                            args=(dict(order), "rejected"),
+                            daemon=True,
+                        ).start()
+                        st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Auto-refresh — triggers a Streamlit rerun every REFRESH_INTERVAL seconds
+# without a full browser page reload. st_autorefresh uses a tiny custom
+# component with an internal JS counter; each tick increments the counter,
+# Streamlit detects the widget value change and reruns the script cleanly.
+# This preserves session state and avoids the blank-flash / stale-content
+# artefacts caused by window.location.reload() or time.sleep + st.rerun.
+# ---------------------------------------------------------------------------
+st_autorefresh(interval=REFRESH_INTERVAL * 1000, key="dashboard_refresh")

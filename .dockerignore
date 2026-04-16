@@ -1,0 +1,27 @@
+# Python runtime artefacts
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Secrets — provided at runtime via env_file in docker-compose.yml
+.env
+
+# Version control
+.git/
+.gitignore
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Docker files themselves (no need to copy into image)
+Dockerfile
+docker-compose.yml
+.dockerignore
