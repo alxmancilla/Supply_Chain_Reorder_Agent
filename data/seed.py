@@ -23,9 +23,9 @@ load_dotenv()
 
 client = MongoClient(
     os.environ["MONGODB_URI"],
-    serverSelectionTimeoutMS=5_000,
-    connectTimeoutMS=10_000,
-    socketTimeoutMS=30_000,
+    serverSelectionTimeoutMS=30_000,
+    connectTimeoutMS=20_000,
+    socketTimeoutMS=45_000,
 )
 db = client["supply_chain_demo"]
 
@@ -1137,8 +1137,26 @@ def create_atlas_indexes() -> None:
         print(f"  Create it manually in the Atlas UI: field=embedding, dims={EMBEDDING_DIMS}, similarity=cosine")
 
 
+def _wait_for_mongo(max_attempts: int = 5, delay: int = 5) -> None:
+    """Retry server_info() with backoff — Docker cold-start can be slow."""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            version = client.server_info()["version"]
+            print(f"Connected to MongoDB {version}\n")
+            return
+        except Exception as exc:
+            if attempt == max_attempts:
+                raise
+            print(
+                f"[{attempt}/{max_attempts}] MongoDB not reachable yet ({exc}). "
+                f"Retrying in {delay}s …"
+            )
+            time.sleep(delay)
+            delay = min(delay * 2, 30)
+
+
 if __name__ == "__main__":
-    print(f"Connected to MongoDB {client.server_info()['version']}\n")
+    _wait_for_mongo()
     seed_inventory()
     seed_suppliers()
     seed_consumption_history()
