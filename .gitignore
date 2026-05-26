@@ -13,5 +13,8 @@ __pycache__/
 # Streamlit
 .streamlit/
 
+# Auth credentials — never commit
+auth/users.yaml
+
 # macOS
 .DS_Store

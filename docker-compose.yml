@@ -38,10 +38,22 @@ services:
 
   # ── LangGraph agent ────────────────────────────────────────────────────
   # Watches reorder_alerts via MongoDB Change Stream; for each new alert it
-  # runs the assess → gather → reason → save graph and writes a proposed order.
+  # runs the multi-agent graph (retrieval → analysis → recommendation →
+  # audit → save / escalate) and writes a proposed order.
   agent:
     <<: *common
     command: python agent/graph.py
+    restart: unless-stopped
+    depends_on:
+      seeder:
+        condition: service_completed_successfully
+
+  # ── Memory retry worker ────────────────────────────────────────────────
+  # Polls failed_memory_writes every 30 s and retries write failures up to
+  # 3 times.  Safe to omit in quick demos; include for production-fidelity.
+  memory-retry-worker:
+    <<: *common
+    command: python agent/memory_retry_worker.py
     restart: unless-stopped
     depends_on:
       seeder:

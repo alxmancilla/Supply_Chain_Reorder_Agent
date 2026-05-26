@@ -27,6 +27,9 @@ import sys
 import time
 from datetime import datetime, timezone
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from agent.logger import get_logger
 from kafka import KafkaConsumer
 from pymongo import MongoClient
 
@@ -44,6 +47,8 @@ _db    = _mongo["supply_chain_demo"]
 inventory           = _db["inventory"]
 consumption_history = _db["consumption_history"]
 alerts_collection   = _db["reorder_alerts"]
+
+log = get_logger(__name__)
 
 KAFKA_BROKER = os.environ.get("KAFKA_BROKER", "localhost:9094")
 TOPIC        = "wms-inventory-events"
@@ -88,7 +93,7 @@ def check_and_alert(sku: str, location: str, quantity: int,
     """Apply the consumption event and emit a reorder alert if needed."""
     inv = inventory.find_one({"sku": sku, "location": location})
     if not inv:
-        print(f"  [WARN] No inventory record for {sku} @ {location} — skipping")
+        log.warning("no inventory record found", extra={"sku": sku, "location": location})
         return
 
     on_hand       = max(0, inv["on_hand"] - quantity)
@@ -103,7 +108,7 @@ def check_and_alert(sku: str, location: str, quantity: int,
 
     effective_stock = on_hand + on_order
     if effective_stock >= reorder_point:
-        print(f"[OK]    {sku} @ {location} — on_hand={on_hand} (above reorder point)")
+        log.info("stock OK", extra={"sku": sku, "location": location, "on_hand": on_hand})
         return
 
     avg_daily      = get_avg_daily_consumption(sku)
@@ -113,22 +118,28 @@ def check_and_alert(sku: str, location: str, quantity: int,
         {"sku": sku, "location": location, "status": "pending"}
     )
     if existing:
-        print(f"[SKIP]  {sku} — alert already pending ({on_hand} on hand)")
+        log.info("alert already pending, skipping", extra={
+            "sku": sku, "location": location, "on_hand": on_hand,
+        })
         return
 
     alerts_collection.insert_one({
-        "sku":                     sku,
-        "location":                location,
-        "on_hand":                 on_hand,
-        "on_order":                on_order,
-        "reorder_point":           reorder_point,
-        "avg_daily_consumption":   avg_daily,
-        "days_of_stock_remaining": days_remaining,
-        "status":                  "pending",
-        "source":                  "kafka",
-        "created_at":              datetime.now(timezone.utc),
+        "sku":                        sku,
+        "location":                   location,
+        "on_hand":                    on_hand,
+        "on_order":                   on_order,
+        "reorder_point":              reorder_point,
+        "units_consumed_last_15min":  quantity,
+        "avg_daily_consumption":      avg_daily,
+        "days_of_stock_remaining":    days_remaining,
+        "status":                     "pending",
+        "source":                     "kafka",
+        "created_at":                 datetime.now(timezone.utc),
     })
-    print(f"[ALERT] {sku} @ {location} — {on_hand} units, {days_remaining}d of stock (Kafka)")
+    log.warning("reorder alert created via Kafka", extra={
+        "sku": sku, "location": location,
+        "on_hand": on_hand, "days_remaining": days_remaining,
+    })
 
 # ---------------------------------------------------------------------------
 # Consumer loop
@@ -145,31 +156,43 @@ def _connect(retries: int = 30, delay: int = 5) -> KafkaConsumer:
                 auto_offset_reset="latest",
                 enable_auto_commit=True,
             )
-            print(f"Connected to Kafka at {KAFKA_BROKER}. Listening on '{TOPIC}' …\n")
+            log.info("connected to Kafka", extra={"broker": KAFKA_BROKER, "topic": TOPIC})
             return consumer
         except Exception as exc:
-            print(f"  [{attempt}/{retries}] Waiting for Kafka: {exc}")
+            log.warning("waiting for Kafka", extra={
+                "attempt": attempt, "max_retries": retries, "error": str(exc),
+            })
             time.sleep(delay)
-    print("ERROR: Could not connect to Kafka. Exiting.")
+    log.error("could not connect to Kafka, exiting")
     sys.exit(1)
 
 
 def run() -> None:
+    from agent.schemas import validate_kafka_event, write_dead_letter
+
     consumer = _connect()
     for message in consumer:
         event = message.value
         try:
+            # Validate schema before processing
+            validated, errors = validate_kafka_event(event)
+            if errors:
+                log.warning("invalid Kafka event, dead-lettering", extra={"errors": errors})
+                write_dead_letter(_db, "kafka_consumer", "kafka_message", event, errors)
+                continue
+
             raw_ts    = event.get("timestamp") or datetime.now(timezone.utc).isoformat()
-            timestamp = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
+            timestamp = datetime.fromisoformat(raw_ts.replace("Z", "+00:00")) \
+                if isinstance(raw_ts, str) else raw_ts
             check_and_alert(
-                sku=event["sku"],
-                location=event.get("location", "DC-Unknown"),
-                quantity=int(event.get("quantity", 0)),
+                sku=validated.sku,
+                location=validated.location,
+                quantity=validated.quantity,
                 timestamp=timestamp,
-                reason=event.get("reason", "wms_event"),
+                reason=validated.reason,
             )
         except Exception as exc:
-            print(f"[ERROR] Failed to process event {event}: {exc}")
+            log.error("failed to process Kafka event", extra={"error": str(exc)})
 
 
 if __name__ == "__main__":
