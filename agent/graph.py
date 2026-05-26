@@ -1,19 +1,33 @@
 """
-LangGraph agent — the core of the demo.
+LangGraph agent — multi-agent reorder pipeline.
 
-State machine:
-    START → assess_alert → gather_context → reason_and_draft → save_and_notify → END
+Graph topology:
+    START
+      → assess_alert          (DB-only: inventory position + coverage gap)
+      → route_by_urgency      (conditional: zero-gap fast path vs retrieval)
+          ↘ save_and_notify   (zero-gap fast path — no LLM needed)
+          ↘ retrieval_agent   (ReAct tool-calling loop: gathers context)
+              → analysis_agent        (evaluates suppliers, assigns confidence)
+                  → recommendation_agent  (calculates quantity, writes rationale)
+                      → audit_agent       (validates schema + business rules)
+                          ↘ recommendation_agent  (retry, max 2 times)
+                          ↘ save_and_notify        (valid recommendation)
+      → END
 
-gather_context runs four MongoDB queries concurrently:
-  1. get_supplier_options         (basic find, fill-rate sorted)
-  2. get_consumption_trend        (time series aggregation)
-  3. search_suppliers_by_capability  ← Atlas Search
-  4. find_similar_past_orders        ← Atlas Vector Search
+ReAct retrieval tools:
+  1. get_inventory_position        (basic find)
+  2. get_supplier_options          (basic find, fill-rate sorted)
+  3. get_consumption_trend         (time series aggregation)
+  4. search_suppliers_by_capability   ← Atlas Search
+  5. find_similar_past_orders         ← Atlas Vector Search on order_history
+  6. get_recent_decisions             ← per-SKU rolling 24 h window
+  7. get_learned_patterns             ← Atlas Vector Search on agent_memory
 
 Run as a standalone process — watches reorder_alerts via Change Stream:
     python agent/graph.py
 """
 
+import ast
 import asyncio
 import json
 import os
@@ -21,33 +35,51 @@ import sys
 from datetime import datetime, timezone
 from typing import TypedDict
 
-# Ensure the project root is on sys.path so `agent.*` imports work when the
-# script is run directly as `python agent/graph.py`.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bson import ObjectId
 from dotenv import load_dotenv
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
+from langgraph.prebuilt import create_react_agent
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import MongoClient
 
 from langgraph.checkpoint.mongodb import MongoDBSaver
 
-from agent.prompts import SYSTEM_PROMPT, build_recommendation_prompt
+from agent import sku_lock
+from agent.logger import get_logger
+from agent.schemas import validate_alert, write_dead_letter
+from agent.prompts import (
+    ANALYSIS_SYSTEM_PROMPT,
+    RECOMMENDATION_SYSTEM_PROMPT,
+    RETRIEVAL_SYSTEM_PROMPT,
+    build_analysis_prompt,
+    build_recommendation_prompt,
+)
 from agent.tools import (
+    append_lifecycle_event,
     find_similar_past_orders,
+    get_applicable_procedures,
     get_consumption_trend,
+    get_episode_history,
     get_inventory_position,
+    get_learned_patterns,
     get_long_term_memories,
+    get_recent_decisions,
     get_short_term_memories,
     get_supplier_options,
     search_suppliers_by_capability,
+    validate_recommendation,
     write_long_term_memory_sync,
+    write_order_history_sync,
     write_short_term_memory_sync,
 )
 
 load_dotenv()
+
+log = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Clients
@@ -63,182 +95,149 @@ _db_sync      = _sync_client["supply_chain_demo"]
 _db_async     = _async_client["supply_chain_demo"]
 
 # ---------------------------------------------------------------------------
-# LLM — Grove API gateway (Azure-style api-key auth)
+# LLM — Grove API gateway with fallback + circuit breaker
 # ---------------------------------------------------------------------------
 _GROVE_API_KEY  = os.environ["GROVE_API_KEY"]
 _GROVE_BASE_URL = os.environ["GROVE_API_BASE_URL"]
 
-llm = ChatOpenAI(
+# Optional fallback: set GROVE_FALLBACK_API_KEY and GROVE_FALLBACK_BASE_URL in .env
+# to enable a secondary LLM endpoint when the primary fails.
+_FALLBACK_API_KEY  = os.getenv("GROVE_FALLBACK_API_KEY", _GROVE_API_KEY)
+_FALLBACK_BASE_URL = os.getenv("GROVE_FALLBACK_BASE_URL", _GROVE_BASE_URL)
+_FALLBACK_MODEL    = os.getenv("GROVE_FALLBACK_MODEL", "gpt-5.4")
+
+_llm_primary = ChatOpenAI(
     model="gpt-5.4",
     openai_api_key=_GROVE_API_KEY,
     openai_api_base=_GROVE_BASE_URL,
     default_headers={"api-key": _GROVE_API_KEY},
     temperature=0,
 )
+_llm_fallback = ChatOpenAI(
+    model=_FALLBACK_MODEL,
+    openai_api_key=_FALLBACK_API_KEY,
+    openai_api_base=_FALLBACK_BASE_URL,
+    default_headers={"api-key": _FALLBACK_API_KEY},
+    temperature=0,
+)
 
+# Circuit breaker state — module-level so it survives across graph invocations.
+_circuit_failures: int = 0
+_CIRCUIT_THRESHOLD: int = 3   # consecutive failures before opening the circuit
+
+
+class CircuitOpenError(RuntimeError):
+    """Raised when the LLM circuit breaker is open."""
+
+
+def _get_llm() -> ChatOpenAI:
+    """Return the active LLM, raising CircuitOpenError if the circuit is open."""
+    if _circuit_failures >= _CIRCUIT_THRESHOLD:
+        raise CircuitOpenError(
+            f"LLM circuit breaker open after {_circuit_failures} consecutive failures — "
+            "routing alert to human review queue"
+        )
+    return _llm_primary
+
+
+async def _llm_invoke(messages: list) -> object:
+    """Invoke the LLM with automatic fallback to the secondary endpoint.
+
+    Resets the circuit breaker on success. Increments the failure counter and
+    tries the fallback on primary failure. If both fail, opens the circuit.
+    """
+    global _circuit_failures
+
+    llm_to_use = _get_llm()
+    try:
+        response = await llm_to_use.ainvoke(messages)
+        _circuit_failures = 0   # reset on success
+        return response
+    except CircuitOpenError:
+        raise
+    except Exception as primary_exc:
+        log.warning("primary LLM failed, trying fallback", extra={"error": str(primary_exc)})
+        try:
+            response = await _llm_fallback.ainvoke(messages)
+            _circuit_failures = 0
+            return response
+        except Exception as fallback_exc:
+            _circuit_failures += 1
+            log.error(
+                "fallback LLM also failed",
+                extra={
+                    "error":               str(fallback_exc),
+                    "consecutive_failures": _circuit_failures,
+                    "threshold":           _CIRCUIT_THRESHOLD,
+                },
+            )
+            raise fallback_exc
+
+
+# Keep the bare `llm` name for the ReAct agent (create_react_agent requires it at init time)
+llm = _llm_primary
+
+# ---------------------------------------------------------------------------
+# ReAct retrieval agent — LLM-driven tool selection
+# ---------------------------------------------------------------------------
+_RETRIEVAL_TOOLS = [
+    get_inventory_position,
+    get_supplier_options,
+    get_consumption_trend,
+    search_suppliers_by_capability,
+    find_similar_past_orders,
+    get_recent_decisions,
+    get_learned_patterns,
+    get_episode_history,
+    get_applicable_procedures,
+]
+
+_retrieval_react_agent = create_react_agent(llm, _RETRIEVAL_TOOLS)
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def _serialize_doc(doc: dict) -> dict:
-    """
-    Convert top-level BSON ObjectId values to strings so the LangGraph
-    MongoDBSaver checkpointer (which uses msgpack) can serialize the state.
-    Call this on any MongoDB document before placing it in AgentState.
-    """
+    """Convert top-level BSON ObjectId values to strings for MongoDBSaver."""
     return {k: str(v) if isinstance(v, ObjectId) else v for k, v in doc.items()}
 
 
-# ---------------------------------------------------------------------------
-# State
-# ---------------------------------------------------------------------------
+def _extract_retrieval_results(messages: list) -> tuple[dict, list]:
+    """Extract tool call results and a call trace from ReAct agent messages.
 
-class AgentState(TypedDict):
-    alert:                   dict   # Incoming reorder_alert document
-    inventory:               dict   # get_inventory_position result
-    suppliers:               list   # get_supplier_options result
-    consumption:             dict   # get_consumption_trend result
-    supplier_search_results: list   # Atlas Search result
-    similar_orders:          list   # Atlas Vector Search result
-    short_term_memories:     list   # Per-SKU decisions in last 24 h
-    long_term_memories:      list   # Semantic memories from agent_memory
-    existing_order_qty:      int    # Units already ordered (awaiting or approved) for this SKU+location
-    coverage_gap:            int    # Units still needed to reach the reorder point
-    recommendation:          dict   # LLM output
-    order_id:                str    # _id of saved proposed_order
-
-
-# ---------------------------------------------------------------------------
-# Nodes
-# ---------------------------------------------------------------------------
-
-async def assess_alert(state: AgentState) -> AgentState:
-    """Node 1 — fetch live inventory position and compute the coverage gap.
-
-    The coverage gap is how many additional units are still needed to reach
-    the reorder point after accounting for ALL active proposed orders
-    (awaiting_approval OR approved but not yet delivered).  This prevents the
-    agent from recommending a full reorder when a partial order already exists.
+    Returns (results_by_tool_name, trace_list). If a tool is called multiple
+    times, the last result wins.
     """
-    alert = state["alert"]
-    inv   = get_inventory_position.invoke({"sku": alert["sku"], "location": alert["location"]})
+    results: dict = {}
+    trace: list   = []
 
-    # Sum quantity_recommended across all active orders for this SKU + location.
-    # We deliberately include 'awaiting_approval' orders because their quantity
-    # is NOT yet reflected in inventory.on_order (that only updates on approval).
-    active_orders = list(_db_sync.proposed_orders.find(
-        {
-            "sku":      alert["sku"],
-            "location": alert["location"],
-            "status":   {"$in": ["awaiting_approval", "approved"]},
-        },
-        {"quantity_recommended": 1, "_id": 0},
-    ))
-    existing_order_qty = sum(o.get("quantity_recommended", 0) for o in active_orders)
+    for msg in messages:
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            for tc in msg.tool_calls:
+                trace.append({
+                    "tool": tc["name"],
+                    "args": {k: str(v)[:150] for k, v in tc.get("args", {}).items()},
+                })
+        elif isinstance(msg, ToolMessage):
+            raw = msg.content
+            if isinstance(raw, str):
+                try:
+                    parsed = json.loads(raw)
+                except json.JSONDecodeError:
+                    # LangChain serialises Python lists/dicts as repr strings
+                    # (e.g. "[{'key': 'val'}]") when the tool returns non-JSON.
+                    # ast.literal_eval handles that; fall back to raw string only
+                    # if neither parser works.
+                    try:
+                        parsed = ast.literal_eval(raw)
+                    except (ValueError, SyntaxError):
+                        parsed = raw
+            else:
+                parsed = raw
+            results[msg.name] = parsed
 
-    reorder_point      = inv.get("reorder_point", alert.get("reorder_point", 0))
-    on_hand            = inv.get("on_hand",        alert.get("on_hand",        0))
-    effective_coverage = on_hand + existing_order_qty
-    coverage_gap       = max(0, reorder_point - effective_coverage)
-
-    print(
-        f"  [assess_alert]  {alert['sku']} — "
-        f"on_hand={on_hand}, existing_orders={existing_order_qty}, "
-        f"reorder_point={reorder_point}, coverage_gap={coverage_gap}"
-    )
-    return {
-        **state,
-        "inventory":         inv,
-        "existing_order_qty": existing_order_qty,
-        "coverage_gap":       coverage_gap,
-    }
-
-
-async def gather_context(state: AgentState) -> AgentState:
-    """
-    Node 2 — run six MongoDB queries concurrently:
-      • get_supplier_options              (basic find)
-      • get_consumption_trend             (time series aggregate)
-      • search_suppliers_by_capability    ← Atlas Search
-      • find_similar_past_orders          ← Atlas Vector Search on order_history
-      • get_short_term_memories           ← per-SKU rolling 24 h window
-      • get_long_term_memories            ← Atlas Vector Search on agent_memory
-    """
-    alert     = state["alert"]
-    inventory = state["inventory"]
-    category  = inventory.get("category", "medical")
-    item_name = inventory.get("name", "")
-    days      = alert.get("days_of_stock_remaining", 0)
-
-    if days < 2:
-        urgency_phrase = "urgent emergency expedited critical shortage"
-    elif days < 5:
-        urgency_phrase = "expedited fast priority reliable"
-    else:
-        urgency_phrase = "standard routine planned scheduled"
-
-    capability_query = f"{item_name} {urgency_phrase}"
-    situation_text = (
-        f"{alert['sku']} {item_name} inventory alert at {alert['location']}. "
-        f"On hand: {alert['on_hand']} units, {days} days of stock remaining. "
-        f"Category: {category}. "
-        f"Average daily consumption: {alert.get('avg_daily_consumption', 'unknown')} units/day."
-    )
-    vector_limit = 5 if days < 2 else 3
-
-    loop = asyncio.get_event_loop()
-
-    suppliers_fut    = loop.run_in_executor(
-        None, lambda: get_supplier_options.invoke({"sku": alert["sku"]})
-    )
-    consumption_fut  = loop.run_in_executor(
-        None, lambda: get_consumption_trend.invoke(
-            {"sku": alert["sku"], "location": alert["location"], "days": 14}
-        )
-    )
-    search_fut       = loop.run_in_executor(
-        None, lambda: search_suppliers_by_capability.invoke({"query": capability_query})
-    )
-    vector_fut       = loop.run_in_executor(
-        None, lambda lim=vector_limit: find_similar_past_orders.invoke(
-            {"situation_text": situation_text, "limit": lim, "category": category}
-        )
-    )
-    short_term_fut   = loop.run_in_executor(
-        None, lambda: get_short_term_memories(alert["sku"], alert["location"])
-    )
-    long_term_fut    = loop.run_in_executor(
-        None, lambda st=situation_text: get_long_term_memories(st)
-    )
-
-    (suppliers, consumption, supplier_search,
-     similar_orders, short_term_mems, long_term_mems) = await asyncio.gather(
-        suppliers_fut, consumption_fut, search_fut,
-        vector_fut, short_term_fut, long_term_fut,
-    )
-
-    def _count(results: list) -> int:
-        return len([r for r in results if "error" not in r and "info" not in r])
-
-    print(
-        f"  [gather_context] {alert['sku']} — "
-        f"{len(suppliers)} supplier(s), avg_daily={consumption.get('avg_daily')} u/d, "
-        f"atlas_search={_count(supplier_search)} hits, "
-        f"vector_search={_count(similar_orders)} similar orders, "
-        f"short_term={_count(short_term_mems)} recent, "
-        f"long_term={_count(long_term_mems)} memories"
-    )
-
-    return {
-        **state,
-        "suppliers":               suppliers,
-        "consumption":             consumption,
-        "supplier_search_results": supplier_search,
-        "similar_orders":          similar_orders,
-        "short_term_memories":     short_term_mems,
-        "long_term_memories":      long_term_mems,
-    }
+    return results, trace
 
 
 _JSON_STRIP_FIX = (
@@ -258,77 +257,382 @@ def _parse_llm_json(raw: str) -> dict:
     return json.loads(text.strip())
 
 
-async def reason_and_draft(state: AgentState) -> AgentState:
-    """Node 3 — single LLM call: produce a purchase order recommendation.
+# ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
 
-    Retries up to _MAX_JSON_RETRIES times if the model returns malformed JSON,
-    feeding the parse error back so the model can self-correct.
+class AgentState(TypedDict):
+    # ── Existing fields (populated by assess_alert) ───────────────────────
+    alert:                   dict   # Incoming reorder_alert document
+    inventory:               dict   # get_inventory_position result
+    existing_order_qty:      int    # Units already on active orders for this SKU+location
+    coverage_gap:            int    # Units still needed to reach the reorder point
+    expedite:                bool   # True when days_of_stock_remaining < 2
+
+    # ── Retrieval fields (populated by retrieval_agent_node) ─────────────
+    suppliers:               list   # get_supplier_options result
+    consumption:             dict   # get_consumption_trend result
+    supplier_search_results: list   # Atlas Search result
+    similar_orders:          list   # Atlas Vector Search on order_history
+    short_term_memories:     list   # Per-SKU decisions in last 24 h
+    long_term_memories:      list   # Semantic memories from agent_memory
+    retrieval_results:       dict   # Raw tool results keyed by tool name
+    retrieval_trace:         list   # Ordered list of {tool, args} dicts
+
+    # ── Analysis fields (populated by analysis_agent_node) ────────────────
+    analysis:                dict   # {best_supplier_id, confidence, risk_flags, reasoning_trace}
+
+    # ── Recommendation fields (populated by recommendation_agent_node) ────
+    recommendation:          dict   # {supplier_id, supplier_name, quantity, rationale, confidence}
+
+    # ── Audit fields (populated by audit_agent_node) ──────────────────────
+    audit_result:            dict   # {valid: bool, errors: list[str]}
+    audit_retries:           int    # Number of failed audit attempts so far
+
+    # ── Persistence fields (populated by save_and_notify) ─────────────────
+    order_id:                str    # _id of the saved proposed_order
+
+
+# ---------------------------------------------------------------------------
+# Node 1: assess_alert — DB-only, computes coverage gap
+# ---------------------------------------------------------------------------
+
+async def assess_alert(state: AgentState) -> AgentState:
+    """Fetch live inventory position and compute the coverage gap.
+
+    The coverage gap is how many additional units are still needed to reach
+    the reorder point after accounting for ALL active proposed orders
+    (awaiting_approval OR approved but not yet delivered). This prevents the
+    agent from recommending a full reorder when a partial order already exists.
+    """
+    alert = state["alert"]
+    inv   = get_inventory_position.invoke({"sku": alert["sku"], "location": alert["location"]})
+
+    active_orders = list(_db_sync.proposed_orders.find(
+        {
+            "sku":      alert["sku"],
+            "location": alert["location"],
+            "status":   {"$in": ["awaiting_approval", "approved"]},
+        },
+        {"quantity_recommended": 1, "_id": 0},
+    ))
+    existing_order_qty = sum(o.get("quantity_recommended", 0) for o in active_orders)
+
+    reorder_point      = inv.get("reorder_point", alert.get("reorder_point", 0))
+    on_hand            = inv.get("on_hand",        alert.get("on_hand",        0))
+    effective_coverage = on_hand + existing_order_qty
+    coverage_gap       = max(0, reorder_point - effective_coverage)
+    days               = alert.get("days_of_stock_remaining", 99)
+    expedite           = days < 2
+
+    log.info("coverage gap computed", extra={
+        "phase":              "assess_alert",
+        "sku":                alert["sku"],
+        "location":           alert.get("location"),
+        "on_hand":            on_hand,
+        "existing_orders":    existing_order_qty,
+        "reorder_point":      reorder_point,
+        "coverage_gap":       coverage_gap,
+        "expedite":           expedite,
+    })
+    return {
+        **state,
+        "inventory":          inv,
+        "existing_order_qty": existing_order_qty,
+        "coverage_gap":       coverage_gap,
+        "expedite":           expedite,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Node 2: retrieval_agent — ReAct tool-calling loop
+# ---------------------------------------------------------------------------
+
+async def retrieval_agent_node(state: AgentState) -> AgentState:
+    """Run the ReAct retrieval agent to gather procurement context via tool calls.
+
+    The LLM decides which tools to call and in what order based on the alert
+    urgency and what data is needed. Results are extracted from the message
+    history and mapped back to the standard AgentState fields so downstream
+    nodes (analysis, recommendation, save) can read them as before.
+    """
+    alert     = state["alert"]
+    inventory = state.get("inventory", {})
+    days      = alert.get("days_of_stock_remaining", 99)
+    gap       = state.get("coverage_gap", 0)
+    expedite  = state.get("expedite", False)
+
+    urgency_label = "CRITICAL" if days < 2 else "ELEVATED" if days < 5 else "STANDARD"
+
+    context = (
+        f"Gather context for a procurement decision.\n\n"
+        f"SKU:              {alert['sku']}\n"
+        f"Item name:        {inventory.get('name', 'unknown')}\n"
+        f"Location:         {alert['location']}\n"
+        f"Category:         {inventory.get('category', 'medical')}\n"
+        f"On hand:          {alert.get('on_hand', 0)} units\n"
+        f"Days of stock:    {days}\n"
+        f"Urgency:          {urgency_label}\n"
+        f"Coverage gap:     {gap} units needed\n"
+    )
+    if expedite:
+        context += "⚡ EXPEDITE MODE — prioritise speed and availability over cost.\n"
+
+    try:
+        result = await _retrieval_react_agent.ainvoke(
+            {
+                "messages": [
+                    HumanMessage(content=RETRIEVAL_SYSTEM_PROMPT + "\n\n" + context),
+                ]
+            },
+            config={"recursion_limit": 20},
+        )
+        retrieval_results, retrieval_trace = _extract_retrieval_results(result["messages"])
+    except Exception as exc:
+        log.warning("ReAct agent failed, falling back to direct calls", extra={
+            "phase": "retrieval_agent", "sku": alert.get("sku"), "error": str(exc),
+        })
+        retrieval_results, retrieval_trace = {}, []
+
+    # Map tool results to the existing state fields for downstream compatibility.
+    # Fallback to direct calls if the agent missed a required tool.
+    suppliers = retrieval_results.get("get_supplier_options", [])
+    if not suppliers or (len(suppliers) == 1 and "error" in suppliers[0]):
+        suppliers = get_supplier_options.invoke({"sku": alert["sku"]})
+
+    consumption = retrieval_results.get("get_consumption_trend", {})
+    if not consumption or consumption.get("avg_daily") is None:
+        consumption = get_consumption_trend.invoke(
+            {"sku": alert["sku"], "location": alert["location"], "days": 14}
+        )
+
+    supplier_search = retrieval_results.get("search_suppliers_by_capability", [])
+    similar_orders  = retrieval_results.get("find_similar_past_orders", [])
+    short_term_mems = retrieval_results.get("get_recent_decisions", [])
+    long_term_mems  = retrieval_results.get("get_learned_patterns", [])
+
+    def _count(results: list) -> int:
+        return len([r for r in results if "error" not in r and "info" not in r])
+
+    log.info("retrieval complete", extra={
+        "phase":         "retrieval_agent",
+        "sku":           alert["sku"],
+        "location":      alert.get("location"),
+        "tool_calls":    len(retrieval_trace),
+        "suppliers":     len(suppliers),
+        "avg_daily":     consumption.get("avg_daily"),
+        "trend":         consumption.get("trend", "?"),
+        "atlas_hits":    _count(supplier_search),
+        "vector_hits":   _count(similar_orders),
+        "short_term":    _count(short_term_mems),
+        "long_term":     _count(long_term_mems),
+    })
+
+    return {
+        **state,
+        "suppliers":               suppliers,
+        "consumption":             consumption,
+        "supplier_search_results": supplier_search,
+        "similar_orders":          similar_orders,
+        "short_term_memories":     short_term_mems,
+        "long_term_memories":      long_term_mems,
+        "retrieval_results":       retrieval_results,
+        "retrieval_trace":         retrieval_trace,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Node 3: analysis_agent — supplier evaluation and confidence scoring
+# ---------------------------------------------------------------------------
+
+async def analysis_agent_node(state: AgentState) -> AgentState:
+    """Evaluate retrieved context and produce a structured risk assessment.
+
+    Outputs: best_supplier_id, confidence (high/medium/low), risk_flags, reasoning_trace.
+    Does NOT calculate quantities — that is the recommendation agent's responsibility.
+    """
+    prompt   = build_analysis_prompt(state)
+    messages = [
+        {"role": "system", "content": ANALYSIS_SYSTEM_PROMPT},
+        {"role": "user",   "content": prompt},
+    ]
+
+    analysis = None
+    for attempt in range(_MAX_JSON_RETRIES):
+        response = await _llm_invoke(messages)
+        try:
+            analysis = _parse_llm_json(response.content)
+            break
+        except json.JSONDecodeError as exc:
+            if attempt < _MAX_JSON_RETRIES - 1:
+                print(
+                    f"  [analysis_agent] JSON parse error (attempt {attempt + 1}/"
+                    f"{_MAX_JSON_RETRIES}): {exc} — asking model to self-correct …"
+                )
+                messages = messages + [
+                    {"role": "assistant", "content": response.content},
+                    {"role": "user",      "content": f"{_JSON_STRIP_FIX}\nError: {exc}"},
+                ]
+            else:
+                raise ValueError(
+                    f"Analysis agent returned invalid JSON after {_MAX_JSON_RETRIES} attempts: {exc}"
+                ) from exc
+
+    log.info("analysis complete", extra={
+        "phase":      "analysis_agent",
+        "sku":        state["alert"]["sku"],
+        "location":   state["alert"].get("location"),
+        "supplier":   analysis.get("best_supplier_name"),
+        "confidence": analysis.get("confidence"),
+        "risk_flags": analysis.get("risk_flags", []),
+    })
+    return {**state, "analysis": analysis}
+
+
+# ---------------------------------------------------------------------------
+# Node 4: recommendation_agent — quantity calculation and rationale
+# ---------------------------------------------------------------------------
+
+async def recommendation_agent_node(state: AgentState) -> AgentState:
+    """Draft the final purchase order recommendation.
+
+    Receives the analyst's assessment (confidence, best supplier, risk flags)
+    and produces a quantity + plain-English rationale for the human approver.
+    Appends any previous audit validation errors to the prompt on retry.
     """
     prompt = build_recommendation_prompt(state)
+
+    # On retry: prepend previous validation errors so the agent fixes them.
+    prior_errors = state.get("audit_result", {}).get("errors", [])
+    if prior_errors:
+        error_block = (
+            "\n\nPREVIOUS VALIDATION ERRORS — fix all of these before resubmitting:\n"
+            + "\n".join(f"  - {e}" for e in prior_errors)
+        )
+        prompt = prompt + error_block
+
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": RECOMMENDATION_SYSTEM_PROMPT},
         {"role": "user",   "content": prompt},
     ]
 
     recommendation = None
     for attempt in range(_MAX_JSON_RETRIES):
-        response = await llm.ainvoke(messages)
-        raw      = response.content
+        response = await _llm_invoke(messages)
         try:
-            recommendation = _parse_llm_json(raw)
+            recommendation = _parse_llm_json(response.content)
             break
         except json.JSONDecodeError as exc:
             if attempt < _MAX_JSON_RETRIES - 1:
                 print(
-                    f"  [reason_and_draft] JSON parse error (attempt {attempt + 1}/"
+                    f"  [recommendation_agent] JSON parse error (attempt {attempt + 1}/"
                     f"{_MAX_JSON_RETRIES}): {exc} — asking model to self-correct …"
                 )
                 messages = messages + [
-                    {"role": "assistant", "content": raw},
+                    {"role": "assistant", "content": response.content},
                     {"role": "user",      "content": f"{_JSON_STRIP_FIX}\nError: {exc}"},
                 ]
             else:
                 raise ValueError(
-                    f"LLM returned invalid JSON after {_MAX_JSON_RETRIES} attempts: {exc}"
+                    f"Recommendation agent returned invalid JSON after {_MAX_JSON_RETRIES} attempts: {exc}"
                 ) from exc
 
-    print(
-        f"  [reason_and_draft] {state['alert']['sku']} — "
-        f"recommend {recommendation.get('quantity')} units "
-        f"from {recommendation.get('supplier_name')} "
-        f"(confidence: {recommendation.get('confidence')})"
-    )
+    log.info("recommendation drafted", extra={
+        "phase":      "recommendation_agent",
+        "sku":        state["alert"]["sku"],
+        "location":   state["alert"].get("location"),
+        "quantity":   recommendation.get("quantity"),
+        "supplier":   recommendation.get("supplier_name"),
+        "confidence": recommendation.get("confidence"),
+    })
     return {**state, "recommendation": recommendation}
 
 
-async def save_and_notify(state: AgentState) -> AgentState:
-    """Node 4 — write proposed_order, auto-approve if high confidence, write memories."""
-    alert = state["alert"]
-    rec   = state["recommendation"]
+# ---------------------------------------------------------------------------
+# Node 5: audit_agent — schema and business-rule validation
+# ---------------------------------------------------------------------------
 
-    chosen = next(
-        (s for s in state["suppliers"] if s.get("supplier_id") == rec.get("supplier_id")),
+async def audit_agent_node(state: AgentState) -> AgentState:
+    """Validate the recommendation against schema and business rules.
+
+    If invalid, the recommendation_agent node will be retried (up to 2 times)
+    with the error list injected into its prompt.
+    """
+    rec    = state.get("recommendation", {})
+    errors = validate_recommendation(rec, state)
+    valid  = len(errors) == 0
+    retries = state.get("audit_retries", 0)
+
+    if valid:
+        log.info("recommendation valid", extra={
+            "phase":      "audit_agent",
+            "sku":        state["alert"]["sku"],
+            "location":   state["alert"].get("location"),
+            "quantity":   rec.get("quantity"),
+            "confidence": rec.get("confidence"),
+        })
+    else:
+        log.warning("recommendation invalid", extra={
+            "phase":    "audit_agent",
+            "sku":      state["alert"]["sku"],
+            "location": state["alert"].get("location"),
+            "retry":    retries + 1,
+            "errors":   errors,
+        })
+
+    return {
+        **state,
+        "audit_result":  {"valid": valid, "errors": errors},
+        "audit_retries": retries + (0 if valid else 1),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Node 6: save_and_notify — write proposed_order, memories, update inventory
+# ---------------------------------------------------------------------------
+
+async def save_and_notify(state: AgentState) -> AgentState:
+    """Write proposed_order, auto-approve if high confidence, write memories."""
+    alert        = state["alert"]
+    coverage_gap = state.get("coverage_gap")
+
+    # Zero-gap fast path: route_by_urgency jumped here without running any LLM.
+    # Build a synthetic zero-order recommendation so the rest of the function
+    # works uniformly.
+    rec = state.get("recommendation") or {}
+    if not rec or coverage_gap == 0:
+        existing = state.get("existing_order_qty", 0)
+        reorder  = state.get("inventory", {}).get(
+            "reorder_point", alert.get("reorder_point", 0)
+        )
+        on_hand  = state.get("inventory", {}).get(
+            "on_hand", alert.get("on_hand", 0)
+        )
+        rec = {
+            "supplier_id":   None,
+            "supplier_name": "N/A",
+            "quantity":      0,
+            "rationale":     (
+                f"Existing active orders ({existing} units) plus on-hand stock "
+                f"({on_hand} units) already meet or exceed the reorder point "
+                f"({reorder} units). No additional stock is required."
+            ),
+            "confidence":    "high",
+        }
+
+    chosen     = next(
+        (s for s in state.get("suppliers", []) if s.get("supplier_id") == rec.get("supplier_id")),
         {},
     )
     quantity   = rec.get("quantity", 0)
     unit_price = chosen.get("unit_price", 0.0)
-
-    # Safety override: if existing active orders already cover the reorder point
-    # (coverage_gap == 0), no additional stock is needed regardless of what the
-    # LLM suggested.  Setting quantity to 0 triggers the zero-order auto-approve
-    # path below and closes the alert cleanly without a duplicate order.
-    coverage_gap = state.get("coverage_gap")
-    if coverage_gap is not None and coverage_gap == 0:
-        quantity = 0
     lead_time  = chosen.get("lead_time_days", 0)
     confidence = rec.get("confidence", "medium")
 
-    # Auto-approve conditions (either is sufficient):
-    #   1. High confidence AND total cost is below the approval threshold.
-    #   2. Zero-quantity / zero-cost order (agent decided no stock action is
-    #      needed — nothing to spend, so no human review required).
-    # Orders at or above the cost threshold always require human review
-    # regardless of confidence, giving finance visibility over high-value spend.
+    # Safety override: if existing orders already close the gap, force zero.
+    if coverage_gap is not None and coverage_gap == 0:
+        quantity = 0
+
     AUTO_APPROVE_MAX_COST = 2_500.00
     total_cost    = round(quantity * unit_price, 2)
     zero_order    = quantity == 0 and total_cost == 0.0
@@ -356,35 +660,64 @@ async def save_and_notify(state: AgentState) -> AgentState:
         "atlas_search_used":      len([
             r for r in state.get("supplier_search_results", []) if "error" not in r
         ]) > 0,
+        "retrieval_trace":        state.get("retrieval_trace", []),
         "status":                 status,
         "auto_approved":          auto_approved,
         "created_at":             datetime.now(timezone.utc),
-        # alert["_id"] was serialized to str by _serialize_doc; restore ObjectId
-        # so the reference stored in proposed_orders links correctly in MongoDB.
         "alert_id":               ObjectId(alert["_id"]),
     }
 
     result   = await _db_async.proposed_orders.insert_one(order)
     order_id = str(result.inserted_id)
 
+    # Record confidence outcome for calibration tracking
+    await _db_async.confidence_outcomes.insert_one({
+        "alert_id":              ObjectId(alert["_id"]),
+        "order_id":              result.inserted_id,
+        "predicted_confidence":  confidence,
+        "auto_approved":         auto_approved,
+        "human_decision":        None,
+        "days_to_stock_recovery": None,
+        "outcome":               "pending",
+        "recorded_at":           datetime.now(timezone.utc),
+    })
+
+    # Record agent decision in lifecycle log
+    loop_lc = asyncio.get_event_loop()
+    loop_lc.run_in_executor(
+        None, append_lifecycle_event,
+        alert["_id"], "agent_decision",
+        {
+            "supplier":   rec.get("supplier_name"),
+            "quantity":   quantity,
+            "confidence": confidence,
+            "auto_approved": auto_approved,
+            "order_id":   order_id,
+        },
+        alert["sku"], alert["location"],
+    )
+    loop_lc.run_in_executor(
+        None, append_lifecycle_event,
+        alert["_id"], "order_placed",
+        {"order_id": order_id, "status": status},
+        alert["sku"], alert["location"],
+    )
+
     await _db_async.reorder_alerts.update_one(
         {"_id": ObjectId(alert["_id"])},
         {"$set": {"status": "processed", "order_id": result.inserted_id}},
     )
 
-    # Reflect the approved quantity in inventory.on_order so the dashboard
-    # shows accurate "On Order" numbers and the simulator's effective_stock
-    # check (on_hand + on_order) prevents redundant alerts for this SKU.
     if auto_approved:
         await _db_async.inventory.update_one(
             {"sku": alert["sku"], "location": alert["location"]},
             {"$inc": {"on_order": quantity}},
         )
 
-    # Write short-term and long-term memories concurrently
     days_remaining = alert.get("days_of_stock_remaining", 0)
     trend          = state.get("consumption", {}).get("trend", "stable")
     item_name      = state.get("inventory", {}).get("name", "")
+    category       = state.get("inventory", {}).get("category", "unknown")
     loop = asyncio.get_event_loop()
     await asyncio.gather(
         loop.run_in_executor(
@@ -396,45 +729,175 @@ async def save_and_notify(state: AgentState) -> AgentState:
             alert["sku"], item_name, alert["location"],
             rec, days_remaining, trend, auto_approved,
         ),
+        loop.run_in_executor(
+            None, write_order_history_sync,
+            alert["sku"], alert["location"], category,
+            rec.get("supplier_id"), rec.get("supplier_name", "N/A"),
+            quantity, unit_price, total_cost,
+            days_remaining, trend,
+            rec.get("rationale", ""), result.inserted_id,
+        ),
     )
 
-    if auto_approved and zero_order:
-        approval_tag = "AUTO-APPROVED (zero-quantity / zero-cost order)"
-    elif auto_approved:
-        approval_tag = "AUTO-APPROVED (high confidence + cost below threshold)"
-    elif confidence != "high":
-        approval_tag = "awaiting approval (confidence not high)"
-    else:
-        approval_tag = f"awaiting approval (cost ${total_cost:,.2f} ≥ $10,000 threshold)"
-    print(
-        f"  [save_and_notify] Order saved (id={order_id}), "
-        f"total=${order['total_cost']:.2f}, "
-        f"status={approval_tag}, "
-        f"similar_orders_stored={len(clean_similar)}"
-    )
+    log.info("order saved", extra={
+        "phase":                 "save_and_notify",
+        "sku":                   alert["sku"],
+        "location":              alert.get("location"),
+        "order_id":              order_id,
+        "quantity":              quantity,
+        "total_cost":            order["total_cost"],
+        "status":                status,
+        "auto_approved":         auto_approved,
+        "zero_order":            zero_order,
+        "similar_orders_stored": len(clean_similar),
+    })
     return {**state, "order_id": order_id}
 
 
 # ---------------------------------------------------------------------------
-# Graph
+# Node: escalate_alert — persist escalation record and notify webhook
+# ---------------------------------------------------------------------------
+
+async def _notify_escalation_webhook(url: str, sku: str, alert: dict, reason: str) -> None:
+    """POST a JSON escalation notification to the configured webhook URL."""
+    payload = json.dumps({
+        "sku":          sku,
+        "location":     alert.get("location", ""),
+        "reason":       reason,
+        "escalated_at": datetime.now(timezone.utc).isoformat(),
+    }).encode()
+
+    def _post() -> None:
+        import urllib.request
+        req = urllib.request.Request(
+            url, data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=5)
+
+    loop = asyncio.get_event_loop()
+    try:
+        await loop.run_in_executor(None, _post)
+        print(f"  [escalate] Webhook notified for {sku}")
+    except Exception as exc:
+        print(f"  [escalate] Webhook notification failed: {exc}")
+
+
+async def escalate_alert(state: AgentState) -> AgentState:
+    """Write an escalation record after max audit retries are exhausted.
+
+    Triggered by route_after_audit when audit_retries >= 2 and the
+    recommendation is still invalid.  Writes to escalation_queue, marks the
+    alert as 'escalated', and optionally POSTs a webhook notification.
+    """
+    alert  = state["alert"]
+    sku    = alert.get("sku", "?")
+    reason = "audit_max_retries"
+
+    alert_oid = ObjectId(alert["_id"]) if isinstance(alert["_id"], str) else alert["_id"]
+
+    lifecycle_doc = _db_sync.alert_lifecycle.find_one({"alert_id": str(alert.get("_id", ""))})
+    rejection_history = []
+    if lifecycle_doc:
+        rejection_history = [
+            e for e in lifecycle_doc.get("events", [])
+            if e.get("type") == "human_rejected"
+        ]
+
+    await _db_async.escalation_queue.update_one(
+        {"alert_id": alert_oid},
+        {"$set": {
+            "alert_id":            alert_oid,
+            "sku":                 sku,
+            "location":            alert.get("location", ""),
+            "rejection_count":     alert.get("rejection_count", 0),
+            "escalated_at":        datetime.now(timezone.utc),
+            "rejection_history":   rejection_history,
+            "last_recommendation": state.get("recommendation", {}),
+            "last_audit_errors":   state.get("audit_result", {}).get("errors", []),
+            "escalation_reason":   reason,
+        }},
+        upsert=True,
+    )
+    await _db_async.reorder_alerts.update_one(
+        {"_id": alert_oid},
+        {"$set": {"status": "escalated"}},
+    )
+
+    webhook_url = os.getenv("ESCALATION_WEBHOOK_URL")
+    if webhook_url:
+        await _notify_escalation_webhook(webhook_url, sku, alert, reason)
+
+    log.warning("alert escalated", extra={
+        "phase":    "escalate",
+        "sku":      sku,
+        "location": alert.get("location"),
+        "reason":   reason,
+    })
+    return {**state}
+
+
+# ---------------------------------------------------------------------------
+# Routing functions
+# ---------------------------------------------------------------------------
+
+def route_by_urgency(state: AgentState) -> str:
+    """Short-circuit to save_and_notify when coverage_gap is already zero."""
+    if state.get("coverage_gap") == 0:
+        return "save_and_notify"
+    return "retrieval_agent"
+
+
+def route_after_audit(state: AgentState) -> str:
+    """Route after audit: valid → save, max retries → escalate, else → retry."""
+    if state.get("audit_result", {}).get("valid"):
+        return "save_and_notify"
+    if state.get("audit_retries", 0) >= 2:
+        log.warning("audit max retries reached, escalating", extra={
+            "phase": "audit_agent",
+            "sku":   state["alert"]["sku"],
+        })
+        return "escalate"
+    return "recommendation_agent"
+
+
+# ---------------------------------------------------------------------------
+# Graph construction
 # ---------------------------------------------------------------------------
 
 def build_graph():
     builder = StateGraph(AgentState)
-    builder.add_node("assess_alert",     assess_alert)
-    builder.add_node("gather_context",   gather_context)
-    builder.add_node("reason_and_draft", reason_and_draft)
-    builder.add_node("save_and_notify",  save_and_notify)
 
-    builder.add_edge(START,              "assess_alert")
-    builder.add_edge("assess_alert",     "gather_context")
-    builder.add_edge("gather_context",   "reason_and_draft")
-    builder.add_edge("reason_and_draft", "save_and_notify")
-    builder.add_edge("save_and_notify",  END)
+    builder.add_node("assess_alert",         assess_alert)
+    builder.add_node("retrieval_agent",      retrieval_agent_node)
+    builder.add_node("analysis_agent",       analysis_agent_node)
+    builder.add_node("recommendation_agent", recommendation_agent_node)
+    builder.add_node("audit_agent",          audit_agent_node)
+    builder.add_node("escalate",             escalate_alert)
+    builder.add_node("save_and_notify",      save_and_notify)
 
-    # MongoDBSaver persists the full graph state for every alert invocation.
-    # Checkpoints land in the `checkpoints` collection of supply_chain_demo.
-    # Each alert gets its own thread_id (= alert _id) so runs are isolated.
+    builder.add_edge(START, "assess_alert")
+    builder.add_conditional_edges(
+        "assess_alert",
+        route_by_urgency,
+        {"save_and_notify": "save_and_notify", "retrieval_agent": "retrieval_agent"},
+    )
+    builder.add_edge("retrieval_agent",      "analysis_agent")
+    builder.add_edge("analysis_agent",       "recommendation_agent")
+    builder.add_edge("recommendation_agent", "audit_agent")
+    builder.add_conditional_edges(
+        "audit_agent",
+        route_after_audit,
+        {
+            "save_and_notify":      "save_and_notify",
+            "recommendation_agent": "recommendation_agent",
+            "escalate":             "escalate",
+        },
+    )
+    builder.add_edge("escalate",      END)
+    builder.add_edge("save_and_notify", END)
+
     checkpointer = MongoDBSaver(_sync_client, db_name="supply_chain_demo")
     return builder.compile(checkpointer=checkpointer)
 
@@ -443,7 +906,7 @@ graph = build_graph()
 
 
 # ---------------------------------------------------------------------------
-# Change Stream listener — with resume token persistence and crash recovery
+# Change Stream listener — resume token persistence + crash recovery
 # ---------------------------------------------------------------------------
 
 _AGENT_STATE_COLLECTION = "agent_state"
@@ -451,20 +914,14 @@ _RESUME_TOKEN_DOC_ID    = "change_stream_resume_token"
 
 
 def _load_resume_token() -> dict | None:
-    """Load the last persisted Change Stream resume token from MongoDB.
-
-    Returns None if no token has been saved yet (first run) so the stream
-    starts from the current position.
-    """
     doc = _db_sync[_AGENT_STATE_COLLECTION].find_one({"_id": _RESUME_TOKEN_DOC_ID})
     if doc and "token" in doc:
-        print(f"[AGENT] Resuming Change Stream from saved token …")
+        log.info("resuming Change Stream from saved token")
         return doc["token"]
     return None
 
 
 def _save_resume_token(token: dict) -> None:
-    """Persist the Change Stream resume token so restarts don't miss events."""
     _db_sync[_AGENT_STATE_COLLECTION].update_one(
         {"_id": _RESUME_TOKEN_DOC_ID},
         {"$set": {"token": token, "saved_at": datetime.now(timezone.utc)}},
@@ -473,31 +930,125 @@ def _save_resume_token(token: dict) -> None:
 
 
 async def _process_one_alert(alert_doc: dict) -> None:
-    """Invoke the agent graph for a single alert document."""
-    sku        = alert_doc.get("sku", "?")
-    thread_id  = str(alert_doc["_id"])
-    alert_doc  = _serialize_doc(alert_doc)
-    config     = {"configurable": {"thread_id": thread_id}}
-    await graph.ainvoke({"alert": alert_doc}, config=config)
-    print(f"[AGENT] Done — order drafted for {sku}")
+    """Invoke the agent graph for a single alert document.
+
+    Pre-graph checks (in order):
+    1. LLM circuit breaker open → route to human_review_queue.
+    2. rejection_count >= 3 → escalate directly without re-running the LLM.
+    3. Atomic alert claim (pending → processing) — prevents two workers from
+       racing to handle the same alert document.
+    4. SKU-level distributed lock — prevents concurrent pipelines for the same
+       (sku, location), closing the TOCTOU gap between assess_alert reading the
+       coverage gap and save_and_notify writing the order.
+    """
+    sku       = alert_doc.get("sku", "?")
+    location  = alert_doc.get("location", "")
+    thread_id = str(alert_doc["_id"])
+    alert_id  = thread_id
+
+    # ── 1. Circuit breaker ────────────────────────────────────────────────────
+    if _circuit_failures >= _CIRCUIT_THRESHOLD:
+        log.error("circuit breaker open, routing to human review queue", extra={
+            "phase": "process_alert", "sku": sku,
+        })
+        _db_sync.human_review_queue.update_one(
+            {"alert_id": ObjectId(alert_doc["_id"])},
+            {"$set": {
+                "alert_id":       ObjectId(alert_doc["_id"]),
+                "sku":            sku,
+                "location":       location,
+                "reason":         "llm_circuit_open",
+                "queued_at":      datetime.now(timezone.utc),
+                "alert_snapshot": alert_doc,
+            }},
+            upsert=True,
+        )
+        return
+
+    # ── 2. Rejection escalation ───────────────────────────────────────────────
+    rejection_count = alert_doc.get("rejection_count", 0)
+    if rejection_count >= 3:
+        log.warning("too many human rejections, escalating directly", extra={
+            "phase": "process_alert", "sku": sku, "rejection_count": rejection_count,
+        })
+        alert_oid = ObjectId(alert_doc["_id"])
+        await _db_async.escalation_queue.update_one(
+            {"alert_id": alert_oid},
+            {"$set": {
+                "alert_id":          alert_oid,
+                "sku":               sku,
+                "location":          location,
+                "rejection_count":   rejection_count,
+                "escalated_at":      datetime.now(timezone.utc),
+                "escalation_reason": "human_rejections",
+            }},
+            upsert=True,
+        )
+        await _db_async.reorder_alerts.update_one(
+            {"_id": alert_oid},
+            {"$set": {"status": "escalated"}},
+        )
+        webhook_url = os.getenv("ESCALATION_WEBHOOK_URL")
+        if webhook_url:
+            await _notify_escalation_webhook(webhook_url, sku, alert_doc, "human_rejections")
+        return
+
+    # ── 3. Atomic alert claim (pending → processing) ──────────────────────────
+    # Only one worker can win this update. If claimed is None, another worker
+    # already grabbed this alert (or it was already processed).
+    claimed = await _db_async.reorder_alerts.find_one_and_update(
+        {"_id": ObjectId(alert_doc["_id"]), "status": "pending"},
+        {"$set": {"status": "processing"}},
+    )
+    if claimed is None:
+        log.info("alert already claimed by another worker, skipping", extra={
+            "phase": "process_alert", "sku": sku, "alert_id": alert_id,
+        })
+        return
+
+    # ── 4. SKU-level distributed lock ─────────────────────────────────────────
+    # Retry with exponential backoff (1 s → 2 s → 4 s → 8 s → 16 s → 16 s)
+    # up to ~47 s total. A concurrent pipeline for this SKU typically finishes
+    # in < 30 s (one LLM round-trip), so this window is sufficient.
+    lock_acquired = False
+    for attempt in range(6):
+        lock_acquired = await sku_lock.acquire(_db_async, sku, location, alert_id)
+        if lock_acquired:
+            break
+        wait = min(2 ** attempt, 16)
+        log.info("sku lock contention, retrying", extra={
+            "phase": "process_alert", "sku": sku,
+            "attempt": attempt + 1, "wait_s": wait,
+        })
+        await asyncio.sleep(wait)
+
+    if not lock_acquired:
+        log.warning("could not acquire sku lock after retries, deferring alert", extra={
+            "phase": "process_alert", "sku": sku, "alert_id": alert_id,
+        })
+        # Reset to pending so the Change Stream re-fires this alert.
+        await _db_async.reorder_alerts.update_one(
+            {"_id": ObjectId(alert_doc["_id"])},
+            {"$set": {"status": "pending"}},
+        )
+        return
+
+    # ── 5. Invoke the agent graph ─────────────────────────────────────────────
+    try:
+        alert_doc = _serialize_doc(alert_doc)
+        config    = {"configurable": {"thread_id": thread_id}}
+        await graph.ainvoke({"alert": alert_doc}, config=config)
+        log.info("alert processed", extra={"phase": "process_alert", "sku": sku})
+    finally:
+        await sku_lock.release(_db_async, sku, location, alert_id)
 
 
 async def watch_alerts() -> None:
-    """Watch reorder_alerts for new inserts and invoke the agent graph.
+    """Watch reorder_alerts via Change Stream and invoke the agent graph.
 
-    Resilience features:
-    • Resume token  — persisted after every processed event so a restart
-                      picks up exactly where it left off (no missed alerts).
-    • Crash recovery — wraps the stream in a retry loop that handles
-                       ChangeStreamFatalError and InvalidateError (raised when
-                       the collection is dropped, e.g. during a demo reset).
-                       After an invalidation the loop waits briefly then
-                       re-opens a fresh stream from the current position.
+    Resilience: resume token persistence + exponential-backoff reconnection
+    + InvalidateError handling for demo resets (collection drop).
     """
-    # Watch both inserts (new alerts from the simulator) AND updates where
-    # status is reset to "pending" (alert requeued after a human rejection).
-    # The $or pipeline is evaluated server-side so only matching events are
-    # delivered to the agent — no spurious wakeups for unrelated updates.
     pipeline = [{"$match": {"$or": [
         {"operationType": "insert"},
         {
@@ -505,24 +1056,22 @@ async def watch_alerts() -> None:
             "updateDescription.updatedFields.status": "pending",
         },
     ]}}]
-    retry_delay = 2  # seconds; doubles on each consecutive failure up to 30 s
+    retry_delay = 2
+
+    await sku_lock.ensure_indexes(_db_async)
+    log.info("sku_processing_locks indexes ensured")
 
     while True:
         resume_token = _load_resume_token()
-        # updateLookup performs a fresh read from the collection after each event
-        # so the full document is available for both insert and update events.
-        # "required" only guarantees the full document for inserts.
         watch_kwargs = dict(full_document="updateLookup")
         if resume_token:
             watch_kwargs["resume_after"] = resume_token
 
-        print("Agent listening for reorder alerts via Change Stream …\n")
+        log.info("watching for reorder alerts via Change Stream")
         try:
             async with _db_async.reorder_alerts.watch(pipeline, **watch_kwargs) as stream:
-                retry_delay = 2  # reset back-off on successful connection
+                retry_delay = 2
                 async for change in stream:
-                    # Persist the token immediately — even if processing fails
-                    # we won't reprocess the same event on the next restart.
                     _save_resume_token(change["_id"])
 
                     alert_doc = change.get("fullDocument")
@@ -530,26 +1079,34 @@ async def watch_alerts() -> None:
                         continue
 
                     sku = alert_doc.get("sku", "?")
-                    print(f"\n[AGENT] Processing alert for {sku} …")
+                    log.info("processing alert", extra={"sku": sku})
+
+                    _, errors = validate_alert(alert_doc)
+                    if errors:
+                        log.error("alert validation failed", extra={"sku": sku, "errors": errors})
+                        write_dead_letter(
+                            _db_sync, "change_stream", "reorder_alert",
+                            alert_doc, errors,
+                        )
+                        continue
+
                     try:
                         await _process_one_alert(alert_doc)
                     except Exception as exc:  # noqa: BLE001
-                        print(f"[AGENT] Error processing {sku}: {exc}")
+                        log.error("error processing alert", extra={"sku": sku, "error": str(exc)})
 
         except Exception as exc:  # noqa: BLE001
-            # Covers ChangeStreamFatalError, InvalidateError (collection drop),
-            # and transient network errors.
             err_type = type(exc).__name__
-            print(f"[AGENT] Change Stream interrupted ({err_type}: {exc})")
-            print(f"[AGENT] Reconnecting in {retry_delay} s …")
+            log.error("Change Stream interrupted, reconnecting", extra={
+                "error_type":  err_type,
+                "error":       str(exc),
+                "retry_delay": retry_delay,
+            })
             await asyncio.sleep(retry_delay)
             retry_delay = min(retry_delay * 2, 30)
-            # After a collection invalidation, drop the stale token so the
-            # new stream starts from the current head rather than a position
-            # that no longer exists.
             if "InvalidateError" in err_type or "CursorNotFound" in err_type:
                 _db_sync[_AGENT_STATE_COLLECTION].delete_one({"_id": _RESUME_TOKEN_DOC_ID})
-                print("[AGENT] Cleared stale resume token — stream will start fresh.")
+                log.info("cleared stale resume token, stream will start fresh")
 
 
 if __name__ == "__main__":

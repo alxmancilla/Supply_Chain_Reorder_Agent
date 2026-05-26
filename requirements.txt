@@ -10,3 +10,5 @@ openai>=1.30
 voyageai>=0.3.7
 langgraph-checkpoint-mongodb>=0.2
 kafka-python>=2.0.0
+tiktoken>=0.7
+streamlit-authenticator>=0.3.3

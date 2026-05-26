@@ -12,15 +12,52 @@ import os
 import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import streamlit as st
 from dotenv import load_dotenv
 from streamlit_autorefresh import st_autorefresh
 from pymongo import MongoClient
 
-from agent.tools import write_human_decision_memory
+from agent.tools import append_lifecycle_event, write_human_decision_memory
 
 load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Authentication — optional; activated when auth/users.yaml exists.
+# Without the file the dashboard runs unauthenticated (demo / local mode).
+# ---------------------------------------------------------------------------
+
+_AUTH_CONFIG_PATH = Path(__file__).parent / "auth" / "users.yaml"
+_auth_enabled = _AUTH_CONFIG_PATH.exists()
+_current_role  = "admin"   # default when auth is disabled
+
+if _auth_enabled:
+    try:
+        import yaml
+        import streamlit_authenticator as stauth
+
+        with open(_AUTH_CONFIG_PATH) as f:
+            _auth_config = yaml.safe_load(f)
+
+        _authenticator = stauth.Authenticate(
+            _auth_config["credentials"],
+            _auth_config["cookie"]["name"],
+            _auth_config["cookie"]["key"],
+            _auth_config["cookie"]["expiry_days"],
+        )
+    except Exception as _auth_exc:
+        _auth_enabled = False
+        _current_role  = "admin"
+        import warnings
+        warnings.warn(f"Auth config load failed — running unauthenticated: {_auth_exc}")
+
+
+def _check_role(required_role: str) -> bool:
+    """Return True if the current user has at least the required access level."""
+    _hierarchy = {"viewer": 0, "approver": 1, "admin": 2}
+    return _hierarchy.get(_current_role, 0) >= _hierarchy.get(required_role, 0)
+
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -70,6 +107,58 @@ def _ago(dt) -> str:
         return f"{secs // 3600}h ago"
     except Exception:
         return "?"
+
+
+def _delivery_timing(order: dict) -> str:
+    """Return a delivery status string for the order card (1 min = 1 demo day)."""
+    status = order.get("status")
+    try:
+        if status == "received":
+            dt = order.get("delivered_at")
+            label = "on time" if order.get("on_time", True) else "delayed"
+            return f"📬 Delivered {_ago(dt)} ({label})"
+        if status == "approved":
+            created_at = order.get("created_at")
+            if not created_at:
+                return ""
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            expected_days = order.get("expected_delivery_days", 3)
+            delay_days    = order.get("demo_delivery_delay_days", 0)
+            total_secs    = (expected_days + delay_days) * 60   # 1 min = 1 day
+            elapsed       = (datetime.now(timezone.utc) - created_at).total_seconds()
+            remaining     = int(total_secs - elapsed)
+            if remaining > 0:
+                return f"🚚 Due in ~{remaining}s ({expected_days + delay_days} demo days)"
+            return "🚚 Delivering imminently…"
+    except Exception:
+        pass
+    return ""
+
+# ---------------------------------------------------------------------------
+# Authentication gate — renders login page when auth is enabled and user is not
+# logged in; sets _current_role for the rest of the script on success.
+# ---------------------------------------------------------------------------
+
+if _auth_enabled:
+    try:
+        _name, _auth_status, _username = _authenticator.login("Login", "main")
+    except Exception:
+        _auth_status = None
+        _name = ""
+        _username = ""
+
+    if _auth_status is False:
+        st.error("Incorrect username or password.")
+        st.stop()
+    elif _auth_status is None:
+        st.warning("Please enter your username and password.")
+        st.stop()
+    else:
+        _current_role = _auth_config["credentials"]["usernames"].get(
+            _username, {}
+        ).get("role", "viewer")
+        _authenticator.logout("Logout", "sidebar")
 
 # ---------------------------------------------------------------------------
 # CSS — Professional WMS-style theme
@@ -148,6 +237,7 @@ st.markdown("""
 .feed-card.high   { border-left-color: #dd6b20; }
 .feed-card.medium { border-left-color: #d69e2e; }
 .feed-card.ok     { border-left-color: #38a169; }
+.feed-card.teal   { border-left-color: #319795; }
 .feed-hdr  { display: flex; justify-content: space-between; align-items: flex-start; }
 .feed-sku  { font-size: 0.88rem; font-weight: 700; color: #1a202c; }
 .feed-loc  { font-size: 0.72rem; color: #718096; }
@@ -168,6 +258,7 @@ st.markdown("""
 .b-ok     { background:#c6f6d5; color:#22543d; }
 .b-info   { background:#bee3f8; color:#2a4365; }
 .b-purple { background:#e9d8fd; color:#44337a; }
+.b-teal   { background:#b2f5ea; color:#234e52; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -387,18 +478,71 @@ with st.sidebar:
         st.success("✅ Demo reset! Collections cleared — simulator restarted at 1× speed.")
         st.rerun()
 
+    # ── Admin Panel ───────────────────────────────────────────────────────
+    if _check_role("admin"):
+        st.divider()
+        st.subheader("🛠 Admin Panel")
+
+        # Circuit breaker reset
+        import agent.graph as _agent_graph
+        cb_open = _agent_graph._circuit_failures >= _agent_graph._CIRCUIT_THRESHOLD
+        if cb_open:
+            st.warning(f"⚡ Circuit breaker OPEN ({_agent_graph._circuit_failures} failures)")
+            if st.button("🔌 Reset Circuit Breaker", use_container_width=True):
+                _agent_graph._circuit_failures = 0
+                st.success("Circuit breaker reset — LLM calls resumed.")
+                st.rerun()
+        else:
+            st.caption(f"Circuit breaker: 🟢 Closed ({_agent_graph._circuit_failures}/{_agent_graph._CIRCUIT_THRESHOLD} failures)")
+
+        # Procedural memory extraction
+        st.caption("Extract supplier preference rules from repeated approvals (≥5 same supplier in 30 days).")
+        if st.button("📐 Extract Rules", use_container_width=True):
+            try:
+                from agent.procedure_extractor import extract_procedures
+                candidates = extract_procedures()
+                if candidates:
+                    st.success(f"✅ Extracted {len(candidates)} candidate rule(s). Review them in the Procedures collection.")
+                else:
+                    st.info("No new patterns found yet — need ≥5 approvals for the same supplier/category/location.")
+            except Exception as _exc:
+                st.error(f"Extraction failed: {_exc}")
+
+        # Memory compaction
+        st.caption("Deduplicate and summarize old agent memories (entries older than 30 days).")
+        if st.button("🗜 Compact Memory", use_container_width=True):
+            try:
+                from agent.memory_compactor import run_compaction
+                result = run_compaction()
+                st.success(
+                    f"✅ Compaction done — {result.get('deduplicated', 0)} duplicates merged, "
+                    f"{result.get('compacted', 0)} old entries summarized."
+                )
+            except Exception as _exc:
+                st.error(f"Compaction failed: {_exc}")
+
 # ---------------------------------------------------------------------------
 # Data fetching
 # ---------------------------------------------------------------------------
 inventory_docs = list(db.inventory.find({}, {"_id": 0}).sort("sku", 1))
 inventory_docs.sort(key=lambda x: (0 if x["on_hand"] < x["reorder_point"] else 1, x["sku"]))
 
-alert_docs = list(db.reorder_alerts.find({"status": "pending"}).sort("created_at", -1).limit(20))
-order_docs = list(db.proposed_orders.find({}).sort("created_at", -1).limit(20))
-order_docs.sort(key=lambda o: (
-    {"awaiting_approval": 0, "approved": 1, "rejected": 2}.get(o.get("status"), 1),
+alert_docs      = list(db.reorder_alerts.find({"status": "pending"}).sort("created_at", -1).limit(20))
+escalation_docs      = list(db.escalation_queue.find().sort("escalated_at", -1).limit(10))
+escalated_count      = db.reorder_alerts.count_documents({"status": "escalated"})
+failed_writes_count  = db.failed_memory_writes.count_documents({"resolved": False})
+# Always show ALL pending approvals; cap non-pending history at 10.
+_pending_orders = list(db.proposed_orders.find(
+    {"status": "awaiting_approval"}
+).sort("created_at", -1))
+_history_orders = list(db.proposed_orders.find(
+    {"status": {"$ne": "awaiting_approval"}}
+).sort("created_at", -1).limit(5))
+_history_orders.sort(key=lambda o: (
+    {"approved": 0, "received": 1, "rejected": 2}.get(o.get("status"), 1),
     -(o["created_at"].timestamp() if hasattr(o.get("created_at"), "timestamp") else 0),
 ))
+order_docs = _pending_orders + _history_orders
 
 # KPI aggregates — single $facet round-trip instead of multiple count_documents
 below_reorder  = sum(1 for i in inventory_docs if i["on_hand"] < i["reorder_point"])
@@ -410,13 +554,15 @@ _order_kpis = list(db.proposed_orders.aggregate([
         "auto":      [{"$match": {"auto_approved": True}}, {"$count": "n"}],
     }}
 ]))
-_total_orders = _order_kpis[0]["total"][0]["n"]  if _order_kpis and _order_kpis[0]["total"]  else 0
-_total_auto   = _order_kpis[0]["auto"][0]["n"]   if _order_kpis and _order_kpis[0]["auto"]   else 0
-mem_count     = db.agent_memory.count_documents({})
+_total_orders   = _order_kpis[0]["total"][0]["n"]  if _order_kpis and _order_kpis[0]["total"]  else 0
+_total_auto     = _order_kpis[0]["auto"][0]["n"]   if _order_kpis and _order_kpis[0]["auto"]   else 0
+received_count  = db.proposed_orders.count_documents({"status": "received"})
+mem_count       = db.agent_memory.count_documents({})
 
 _kpi_below  = "red"   if below_reorder >= 4  else ("amber" if below_reorder >= 1 else "green")
 _kpi_alerts = "red"   if len(alert_docs) >= 5 else ("amber" if alert_docs else "green")
 _kpi_queue  = "amber" if awaiting_count >= 1  else "green"
+_kpi_esc    = "red"   if escalated_count >= 1  else "green"
 
 # ---------------------------------------------------------------------------
 # Top bar
@@ -462,7 +608,17 @@ st.markdown(f"""
   <div class="kpi-card blue">
     <div class="kpi-lbl">⚡ Auto-Approved</div>
     <div class="kpi-val">{_total_auto}</div>
-    <div class="kpi-sub">{int(_total_auto/max(_total_orders,1)*100)}% of {_total_orders} decisions · {mem_count} memories</div>
+    <div class="kpi-sub">{int(_total_auto/max(_total_orders,1)*100)}% of {_total_orders} decisions · {mem_count} memories · {failed_writes_count} failed writes</div>
+  </div>
+  <div class="kpi-card green">
+    <div class="kpi-lbl">📬 Delivered</div>
+    <div class="kpi-val">{received_count}</div>
+    <div class="kpi-sub">orders received (1 min = 1 day)</div>
+  </div>
+  <div class="kpi-card {_kpi_esc}">
+    <div class="kpi-lbl">🔺 Escalated</div>
+    <div class="kpi-val">{escalated_count}</div>
+    <div class="kpi-sub">alerts requiring human review</div>
   </div>
 </div>
 """, unsafe_allow_html=True)
@@ -567,11 +723,20 @@ with right_col:
                         "low":    '<span class="badge b-crit">LOW</span>'}.get(confidence, "")
             status_b = {"awaiting_approval": '<span class="badge b-info">AWAITING</span>',
                         "approved":          '<span class="badge b-ok">APPROVED</span>',
-                        "rejected":          '<span class="badge b-crit">REJECTED</span>'}.get(status, "")
+                        "rejected":          '<span class="badge b-crit">REJECTED</span>',
+                        "received":          '<span class="badge b-teal">📦 RECEIVED</span>'}.get(status, "")
             auto_b   = '<span class="badge b-purple">⚡ AUTO</span>'   if auto_approved else ""
             srch_b   = '<span class="badge b-info">🔍 SEARCH</span>'  if used_search   else ""
-            card_cls = "ok" if status == "approved" else ("crit" if status == "rejected" else "medium")
+            card_cls = ("teal" if status == "received"
+                        else "ok" if status == "approved"
+                        else "crit" if status == "rejected"
+                        else "medium")
 
+            timing_line = _delivery_timing(order)
+            timing_html = (
+                f'<div style="font-size:0.7rem;color:#718096;margin:3px 0 2px">{timing_line}</div>'
+                if timing_line else ""
+            )
             with st.container():
                 st.markdown(f"""
 <div class="feed-card {card_cls}">
@@ -581,7 +746,7 @@ with right_col:
     <span class="feed-age">{_ago(order.get('created_at'))}</span>
   </div>
   <div style="margin:4px 0">{conf_b}{status_b}{auto_b}{srch_b}</div>
-  <div class="feed-nums">
+  {timing_html}<div class="feed-nums">
     <div><div class="feed-nv">{order['quantity_recommended']:,}</div><div class="feed-nl">Qty</div></div>
     <div><div class="feed-nv">${order['total_cost']:,.0f}</div><div class="feed-nl">Cost</div></div>
     <div><div class="feed-nv">{order['expected_delivery_days']}d</div><div class="feed-nl">Lead</div></div>
@@ -607,39 +772,164 @@ with right_col:
                 if status == "awaiting_approval":
                     btn1, btn2 = st.columns(2)
                     oid = order["_id"]
-                    if btn1.button("✅ Approve", key=f"approve_{oid}", use_container_width=True):
+                    _can_approve = _check_role("approver")
+                    if not _can_approve:
+                        st.caption("🔒 Viewer access — approval requires Approver or Admin role.")
+                    if _can_approve and btn1.button("✅ Approve", key=f"approve_{oid}", use_container_width=True):
                         db.proposed_orders.update_one({"_id": oid}, {"$set": {"status": "approved"}})
                         db.inventory.update_one(
                             {"sku": order["sku"], "location": order["location"]},
                             {"$inc": {"on_order": order["quantity_recommended"]}},
                         )
-                        # Record the human approval in both memory layers.
-                        # Runs in a background thread so the UI reruns immediately
-                        # without waiting for the Voyage AI embedding call.
+                        db.confidence_outcomes.update_one(
+                            {"order_id": oid},
+                            {"$set": {"human_decision": "approved", "outcome": "resolved"}},
+                        )
+                        db.order_history.update_one(
+                            {"proposed_order_id": oid},
+                            {"$set": {"outcome": "human_approved"}},
+                        )
                         threading.Thread(
                             target=write_human_decision_memory,
                             args=(dict(order), "approved"),
                             daemon=True,
                         ).start()
+                        threading.Thread(
+                            target=append_lifecycle_event,
+                            args=(
+                                str(order.get("alert_id", "")),
+                                "human_approved",
+                                {"order_id": str(oid)},
+                                order.get("sku", ""),
+                                order.get("location", ""),
+                            ),
+                            daemon=True,
+                        ).start()
                         st.rerun()
-                    if btn2.button("❌ Reject", key=f"reject_{oid}", use_container_width=True):
+                    if _can_approve and btn2.button("❌ Reject", key=f"reject_{oid}", use_container_width=True):
                         db.proposed_orders.update_one({"_id": oid}, {"$set": {"status": "rejected"}})
+                        db.confidence_outcomes.update_one(
+                            {"order_id": oid},
+                            {"$set": {"human_decision": "rejected", "outcome": "escalated"}},
+                        )
+                        db.order_history.update_one(
+                            {"proposed_order_id": oid},
+                            {"$set": {"outcome": "rejected"}},
+                        )
                         alert_id = order.get("alert_id")
                         if alert_id:
                             db.reorder_alerts.update_one(
                                 {"_id": alert_id},
-                                {"$set": {"status": "pending"}, "$unset": {"order_id": ""}},
+                                {
+                                    "$set":   {"status": "pending"},
+                                    "$unset": {"order_id": ""},
+                                    "$inc":   {"rejection_count": 1},
+                                },
                             )
-                        # Record the human rejection in both memory layers.
-                        # The agent will re-process this alert via Change Stream
-                        # and will now see the rejection in short-term memory.
                         threading.Thread(
                             target=write_human_decision_memory,
                             args=(dict(order), "rejected"),
                             daemon=True,
                         ).start()
+                        threading.Thread(
+                            target=append_lifecycle_event,
+                            args=(
+                                str(order.get("alert_id", "")),
+                                "human_rejected",
+                                {"order_id": str(oid)},
+                                order.get("sku", ""),
+                                order.get("location", ""),
+                            ),
+                            daemon=True,
+                        ).start()
                         st.rerun()
 
+
+    # Confidence Calibration
+    with st.expander("📊 Confidence Calibration", expanded=False):
+        calibration = list(db.confidence_outcomes.aggregate([
+            {"$group": {
+                "_id": {
+                    "confidence": "$predicted_confidence",
+                    "outcome":    "$outcome",
+                },
+                "count": {"$sum": 1},
+            }},
+            {"$sort": {"_id.confidence": 1, "_id.outcome": 1}},
+        ]))
+        if calibration:
+            summary: dict = {}
+            for row in calibration:
+                conf    = row["_id"]["confidence"]
+                outcome = row["_id"]["outcome"]
+                summary.setdefault(conf, {})[outcome] = row["count"]
+
+            rows_html = ""
+            for conf in ["high", "medium", "low"]:
+                if conf not in summary:
+                    continue
+                counts  = summary[conf]
+                total   = sum(counts.values())
+                resolved = counts.get("resolved", 0)
+                pct      = int(resolved / max(total, 1) * 100)
+                rows_html += (
+                    f"<tr><td><b>{conf}</b></td>"
+                    f"<td>{total}</td>"
+                    f"<td>{resolved} ({pct}%)</td>"
+                    f"<td>{counts.get('escalated', 0)}</td>"
+                    f"<td>{counts.get('pending', 0)}</td></tr>"
+                )
+            st.markdown(
+                "<table style='width:100%;font-size:0.82rem'>"
+                "<tr><th>Confidence</th><th>Total</th><th>Resolved</th>"
+                "<th>Escalated</th><th>Pending</th></tr>"
+                + rows_html + "</table>",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.info("No calibration data yet — data accumulates as orders are processed.")
+
+    # Escalated Alerts
+    if escalation_docs:
+        st.markdown(
+            '<div class="panel-hdr" style="margin-top:18px">🔺 Escalated Alerts</div>',
+            unsafe_allow_html=True,
+        )
+        for esc in escalation_docs:
+            reason = esc.get("escalation_reason", "unknown")
+            reason_label = {
+                "human_rejections":  "⛔ Rejected 3× by humans",
+                "audit_max_retries": "⚠️ Audit max retries exhausted",
+            }.get(reason, reason)
+            escalated_at = esc.get("escalated_at")
+            st.markdown(f"""
+<div class="feed-card crit">
+  <div class="feed-hdr">
+    <div><span class="feed-sku">{esc.get('sku','?')}</span>
+    <span class="feed-loc"> @ {esc.get('location','?')}</span></div>
+    <span class="feed-age">{_ago(escalated_at)}</span>
+  </div>
+  <div style="margin:4px 0">
+    <span class="badge b-crit">ESCALATED</span>
+    <span class="badge b-high">{reason_label}</span>
+  </div>
+  <div class="feed-nums">
+    <div><div class="feed-nv">{esc.get('rejection_count', 0)}</div>
+         <div class="feed-nl">Rejections</div></div>
+  </div>
+</div>""", unsafe_allow_html=True)
+
+            last_rec = esc.get("last_recommendation") or {}
+            last_errors = esc.get("last_audit_errors") or []
+            if last_rec or last_errors:
+                with st.expander("Details", expanded=False):
+                    if last_rec:
+                        st.caption("Last recommendation:")
+                        st.json(last_rec)
+                    if last_errors:
+                        st.caption("Audit errors:")
+                        for e in last_errors:
+                            st.markdown(f"- {e}")
 
 # ---------------------------------------------------------------------------
 # Auto-refresh — triggers a Streamlit rerun every REFRESH_INTERVAL seconds

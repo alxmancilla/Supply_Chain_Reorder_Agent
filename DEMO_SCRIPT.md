@@ -25,17 +25,17 @@
 > This demo shows an AI agent doing all of that automatically, in real time,
 > using MongoDB Atlas as the backbone."
 
-**👉 Point at the KPI row (four cards across the top).**
+**👉 Point at the KPI row (five cards across the top).**
 
-> "Four live KPIs: how many SKUs are below reorder point, active alerts pending,
-> orders in the approval queue, and how many were auto-approved. All recompute
-> on every refresh."
+> "Five live KPIs: SKUs below reorder point, active alerts pending,
+> orders awaiting approval, auto-approved count, and escalated alerts.
+> All recompute on every refresh."
 
-**👉 Point at the two-panel layout below.**
+**👉 Point at the three-panel layout below.**
 
-> "Two panels: live inventory grid on the left — critical items sort to the top
-> automatically. Alerts and agent decisions are stacked on the right.
-> Everything refreshes every 5 seconds via MongoDB Change Streams."
+> "Three panels: live inventory grid on the left — critical items sort to the top
+> automatically. Active alerts in the middle, agent decisions on the right.
+> Everything refreshes every 10 seconds via MongoDB Change Streams."
 
 ---
 
@@ -47,7 +47,7 @@
 > how far below the reorder point we are — this one is nearly empty.
 > Each card shows On Hand, On Order, Reorder Point, and Effective stock."
 
-**👉 Point at the Active Alerts section in the right panel when a new alert card appears.**
+**👉 Point at the Active Alerts section when a new alert card appears.**
 
 > "The simulator writes a reorder alert to MongoDB every 10 seconds,
 > mimicking what Atlas Stream Processing would do in production off a
@@ -65,10 +65,17 @@
 
 ## 3 · Show the agent decision `[1:30 – 3:00]`
 
-**👉 Wait for the order card to appear in the Agent Decisions section (right panel, below alerts), then walk through it.**
+**👉 Wait for the order card to appear in the Agent Decisions section, then walk through it.**
 
-> "The agent ran a LangGraph state machine — four nodes, six concurrent
-> MongoDB queries — and produced this recommendation in a few seconds."
+> "The agent ran a multi-agent LangGraph pipeline. Rather than one big LLM call,
+> three specialist agents each do a scoped job:
+> a ReAct retrieval agent decides which MongoDB queries to run — supplier list,
+> consumption trend, Atlas Search, Vector Search — and only fetches what it needs.
+> An analysis agent evaluates the options and assigns confidence.
+> A recommendation agent calculates quantity and writes the rationale.
+> An audit agent validates the output before anything is persisted.
+> If validation fails, the pipeline retries automatically — up to twice —
+> before escalating to the human queue."
 
 **👉 Point at the confidence and status badges.**
 
@@ -110,9 +117,9 @@
 
 ---
 
-## 4 · Show memory growing + reject flow `[3:00 – 4:00]`
+## 4 · Show memory growing + reject / escalation flow `[3:00 – 4:00]`
 
-**👉 Point at the sidebar Demo Status panel (scroll down past Simulator Controls and Supplier Search).**
+**👉 Point at the sidebar Demo Status panel.**
 
 > "Long-term Memories starts at zero. After every decision the agent writes
 > a natural-language summary, embeds it, and stores it in `agent_memory`.
@@ -129,16 +136,21 @@
 > changed in the rationale."
 >
 > "Second — the rejection is written to long-term memory as an embedded
-> document: *'Human REJECTED order for SKU-X from Supplier-Y…'*
-> Every future alert for any similar situation can retrieve this via
-> Vector Search. Human oversight becomes a persistent training signal,
+> document. Human oversight becomes a persistent training signal,
 > not just a one-time gate."
 
 **👉 Watch the new order appear and point at the rationale — it should reference the previous rejection.**
 
 > "The rationale now explicitly acknowledges the prior rejection and
-> explains the change. The agent isn't just re-running the same calculation —
-> it's incorporating the human signal."
+> explains the change."
+
+**👉 Mention the escalation safety net — no need to demonstrate live unless time allows.**
+
+> "There's a safety net built in. If the same alert is rejected three times,
+> the agent stops trying and escalates automatically — it writes the alert to
+> an escalation queue, marks the status 'escalated', and optionally fires a
+> webhook to notify the operations team. Those alerts surface in a dedicated
+> section on the dashboard so nothing falls through the cracks."
 
 **👉 Now click ✅ Approve on any order.**
 
@@ -158,34 +170,35 @@
 
 **👉 Move the ⚡ Drain Speed slider from 1× Normal up to 5× Demo or 10× Chaos.**
 
-> "The Drain Speed slider multiplies the units consumed per simulator tick —
-> 10× Chaos fires alerts across every SKU within seconds. Great for showing
-> the agent handling a surge of concurrent alerts live. Drag it back down
-> any time to return to a comfortable pace."
+> "10× Chaos fires alerts across every SKU within seconds. Great for showing
+> the agent handling a surge of concurrent alerts live."
 
 **👉 Scroll down to Supplier Search in the sidebar, type `cold chain insulin`, press 🔍 Search.**
 
 > "Atlas Search with a compound operator — supplier name matches score three
 > times higher than capability notes, so exact name hits always outrank fuzzy
-> notes hits. Fuzzy matching handles typos within one edit distance.
-> If Atlas Search is unavailable, the UI falls back to a regex search automatically."
+> notes hits. Fuzzy matching handles typos within one edit distance."
+
+**👉 Briefly point at the Confidence Calibration expander in the main panel.**
+
+> "As the agent processes more alerts, a calibration table fills in — predicted
+> confidence level versus actual outcome. Over time you can see whether HIGH
+> confidence correlates with resolved stock, or whether there are systematic
+> gaps to tune."
 
 > "Under the hood this demo touches: **Change Streams** with resume-token
-> persistence so the agent survives restarts without missing a single alert;
-> **Time Series collections** for 90 days of consumption history; **Atlas Search**
-> with boosted compound scoring for supplier ranking; **Atlas Vector Search** on
+> persistence; **Time Series collections** for 90 days of consumption history;
+> **Atlas Search** with boosted compound scoring; **Atlas Vector Search** on
 > two collections — order history pre-filtered by product category, and the
-> agent's own long-term memory — and a **TTL index** that auto-expires
-> short-term memory after 24 hours. Every agent run is checkpointed to
-> MongoDB via LangGraph's `MongoDBSaver`."
+> agent's own long-term memory; a **TTL index** that auto-expires short-term
+> memory after 24 hours; and **LangGraph's `MongoDBSaver`** checkpointing
+> every graph state transition to MongoDB."
 
 **👉 Scroll to the bottom of the sidebar — show the 🔄 Reset Demo button.**
 
 > "One click clears all alerts, orders, agent memory, and checkpoints —
 > inventory and suppliers stay intact. The simulator resets to 1× speed and
-> resumes immediately. No reseeding, no container restart. The Change Stream
-> resume token is also cleared so the agent opens a fresh stream from the
-> current position. Ideal for back-to-back demo runs."
+> resumes immediately. No reseeding, no container restart."
 
 ---
 
@@ -204,12 +217,11 @@
 
 | Segment | Time | Key talking points |
 |---|---|---|
-| Set the scene | 0:00 – 0:30 | KPI row, live inventory grid, 5 s auto-refresh |
+| Set the scene | 0:00 – 0:30 | 5-card KPI row, live inventory grid, 10 s auto-refresh |
 | Alert arrives | 0:30 – 1:30 | Change Stream trigger, urgency badge, PROCESSING state |
-| Agent decision + rationale + Vector Search | 1:30 – 3:00 | 4-criteria confidence, $2,500 ceiling, rising-trend SKUs block HIGH, category-filtered Vector Search |
-| Memory + reject/approve flow | 3:00 – 4:00 | Human decisions tracked in both memory layers; ⚠ tag forces agent to change approach; ✓ tag reinforces supplier choice |
-| Atlas features rapid-fire | 4:00 – 4:30 | Drain Speed slider (Chaos mode), compound Atlas Search boost |
-| Reset Demo | 4:30 – 4:45 | One-click full reset, resume token cleared, no reseeding |
+| Agent decision + rationale + Vector Search | 1:30 – 3:00 | Multi-agent pipeline (retrieve → analyse → recommend → audit), 4-criteria confidence, $2,500 ceiling, rising-trend SKUs block HIGH |
+| Memory + reject / escalation flow | 3:00 – 4:00 | Human decisions in both memory layers, ⚠ tag forces change, 3-rejection escalation safety net |
+| Atlas features rapid-fire | 4:00 – 4:45 | Drain Speed slider (Chaos mode), compound Atlas Search boost, Confidence Calibration tab |
 | Close | 4:45 – 5:00 | ASP / Kafka production path, MongoDB as single platform |
 
 ---
@@ -221,5 +233,6 @@
 | ▶ / ⏸ / ⏹ | Simulator Controls | Start / pause / stop inventory drain |
 | ⚡ Drain Speed | Below start/stop buttons | 1× Normal → 10× Chaos; multiplies units consumed per tick |
 | 🔍 Supplier Search | Mid-sidebar | Atlas Search with compound boosted scoring + fuzzy fallback |
-| 📊 Demo Status | Lower sidebar | Live counts: alerts, decisions, auto-approved %, memories |
+| 📊 Demo Status | Lower sidebar | Live counts: alerts, decisions, auto-approved %, escalations, failed memory writes |
 | 🔄 Reset Demo | Bottom of sidebar | Clears operational data; resets speed to 1×; clears resume token |
+| 🛠 Admin Panel | Below Reset Demo (admin only) | Circuit breaker reset, Extract Rules, Compact Memory |

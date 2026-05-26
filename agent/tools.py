@@ -13,12 +13,17 @@ import os
 import time
 from datetime import datetime, timedelta, timezone
 
+from bson import ObjectId
 import voyageai
 from dotenv import load_dotenv
 from langchain_core.tools import tool
 from pymongo import MongoClient
 
+from agent.logger import get_logger
+
 load_dotenv()
+
+log = get_logger(__name__)
 
 _client = MongoClient(
     os.environ["MONGODB_URI"],
@@ -50,10 +55,34 @@ def _get_embedding(text: str, max_retries: int = 3) -> list:
         except Exception as exc:
             if attempt < max_retries - 1:
                 wait = 2 ** attempt
-                print(f"  [WARN] Embedding attempt {attempt + 1} failed ({exc}); retrying in {wait} s …")
+                log.warning("embedding attempt failed, retrying", extra={
+                    "attempt": attempt + 1, "wait_s": wait, "error": str(exc),
+                })
                 time.sleep(wait)
             else:
                 raise
+
+
+# ---------------------------------------------------------------------------
+# JSON-safe serialiser — LangChain converts tool return values to strings via
+# str(), which produces Python repr for datetime/ObjectId objects.  Neither
+# json.loads nor ast.literal_eval can parse those repr strings, causing
+# downstream nodes to receive a raw string instead of a list/dict.
+# _json_safe() recursively converts non-JSON-serialisable types before the
+# value is returned, so str(result) is always valid Python-literal JSON.
+# ---------------------------------------------------------------------------
+
+def _json_safe(obj):
+    """Recursively convert datetime → ISO string, ObjectId → str."""
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    if isinstance(obj, ObjectId):
+        return str(obj)
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    return obj
 
 
 # ---------------------------------------------------------------------------
@@ -278,14 +307,44 @@ def get_short_term_memories(sku: str, location: str, hours: int = 24) -> list:
     """Return recent agent decisions for this SKU+location from the last N hours."""
     since = datetime.now(timezone.utc) - timedelta(hours=hours)
     try:
-        return list(_db.short_term_memory.find(
+        return _json_safe(list(_db.short_term_memory.find(
             {"sku": sku, "location": location, "decided_at": {"$gte": since}},
             {"_id": 0},
             sort=[("decided_at", -1)],
             limit=5,
-        ))
+        )))
     except Exception as exc:
         return [{"error": f"Short-term memory unavailable: {exc}"}]
+
+
+def _record_failed_memory_write(
+    sku: str,
+    location: str,
+    memory_type: str,
+    error: Exception,
+    payload: dict,
+) -> None:
+    """Insert a structured failure record into failed_memory_writes.
+
+    Called whenever a memory write (short-term or long-term) raises an exception
+    so the failure can be retried by memory_retry_worker.py instead of being
+    silently dropped.
+    """
+    now = datetime.now(timezone.utc)
+    try:
+        _db.failed_memory_writes.insert_one({
+            "sku":          sku,
+            "location":     location,
+            "memory_type":  memory_type,
+            "error":        str(error),
+            "payload":      payload,
+            "retry_count":  0,
+            "created_at":   now,
+            "last_attempt": now,
+            "resolved":     False,
+        })
+    except Exception as inner_exc:
+        log.error("could not record failed memory write to DB", extra={"error": str(inner_exc)})
 
 
 def write_short_term_memory_sync(
@@ -293,21 +352,25 @@ def write_short_term_memory_sync(
     days_remaining: float, auto_approved: bool,
 ) -> None:
     """Persist a decision summary to short_term_memory (TTL=24 h)."""
+    payload = {
+        "sku":                      sku,
+        "location":                 location,
+        "decided_at":               datetime.now(timezone.utc).isoformat(),
+        "supplier_name":            recommendation.get("supplier_name"),
+        "supplier_id":              recommendation.get("supplier_id"),
+        "quantity":                 recommendation.get("quantity"),
+        "confidence":               recommendation.get("confidence"),
+        "days_of_stock_at_decision": days_remaining,
+        "auto_approved":            auto_approved,
+        "rationale_summary":        recommendation.get("rationale", "")[:300],
+    }
     try:
         _db.short_term_memory.insert_one({
-            "sku":                      sku,
-            "location":                 location,
-            "decided_at":               datetime.now(timezone.utc),
-            "supplier_name":            recommendation.get("supplier_name"),
-            "supplier_id":              recommendation.get("supplier_id"),
-            "quantity":                 recommendation.get("quantity"),
-            "confidence":               recommendation.get("confidence"),
-            "days_of_stock_at_decision": days_remaining,
-            "auto_approved":            auto_approved,
-            "rationale_summary":        recommendation.get("rationale", "")[:300],
+            **payload,
+            "decided_at": datetime.now(timezone.utc),
         })
     except Exception as exc:
-        print(f"  [WARN] Short-term memory write failed: {exc}")
+        _record_failed_memory_write(sku, location, "short_term", exc, payload)
 
 
 # ---------------------------------------------------------------------------
@@ -354,9 +417,45 @@ def get_long_term_memories(
         },
     ]
     try:
-        return list(_db.agent_memory.aggregate(pipeline))
+        return _json_safe(list(_db.agent_memory.aggregate(pipeline)))
     except Exception as exc:
         return [{"error": f"Long-term memory retrieval failed: {exc}"}]
+
+
+def write_order_history_sync(
+    sku: str, location: str, category: str,
+    supplier_id: str | None, supplier_name: str,
+    quantity: int, unit_price: float, total_cost: float,
+    days_of_stock: float, trend: str,
+    rationale: str, proposed_order_id,
+) -> None:
+    """Embed the rationale and insert a live order into order_history with outcome='pending'.
+
+    The outcome is updated later: 'human_approved', 'rejected', or 'delivered_on_time'
+    by app.py (approve/reject handlers) and the simulator (stock recovery detection).
+    proposed_order_id links back to proposed_orders for targeted outcome updates.
+    """
+    try:
+        embedding = _get_embedding(rationale)
+        _db.order_history.insert_one({
+            "sku":                  sku,
+            "location":             location,
+            "category":             category,
+            "supplier_id":          supplier_id,
+            "supplier_name":        supplier_name,
+            "quantity":             quantity,
+            "unit_price":           unit_price,
+            "total_cost":           total_cost,
+            "days_of_stock_at_order": days_of_stock,
+            "trend_at_order":       trend,
+            "outcome":              "pending",
+            "ordered_at":           datetime.now(timezone.utc),
+            "rationale":            rationale,
+            "embedding":            embedding,
+            "proposed_order_id":    proposed_order_id,
+        })
+    except Exception as exc:
+        log.warning("could not write to order_history", extra={"sku": sku, "error": str(exc)})
 
 
 def write_long_term_memory_sync(
@@ -378,19 +477,23 @@ def write_long_term_memory_sync(
         f"(confidence: {confidence}). {rationale} "
         f"{'Auto-approved.' if auto_approved else 'Sent for manual approval.'}"
     )
+    payload = {
+        "sku":           sku,
+        "location":      location,
+        "content":       content,
+        "confidence":    confidence,
+        "auto_approved": auto_approved,
+        "created_at":    datetime.now(timezone.utc).isoformat(),
+    }
     try:
         embedding = _get_embedding(content)
         _db.agent_memory.insert_one({
-            "sku":          sku,
-            "location":     location,
-            "content":      content,
-            "embedding":    embedding,
-            "confidence":   confidence,
-            "auto_approved": auto_approved,
-            "created_at":   datetime.now(timezone.utc),
+            **payload,
+            "embedding":  embedding,
+            "created_at": datetime.now(timezone.utc),
         })
     except Exception as exc:
-        print(f"  [WARN] Long-term memory write failed: {exc}")
+        _record_failed_memory_write(sku, location, "long_term", exc, payload)
 
 
 # ---------------------------------------------------------------------------
@@ -429,46 +532,220 @@ def write_human_decision_memory(order_doc: dict, decision: str) -> None:
     decided_at = datetime.now(timezone.utc)
 
     # ── Short-term memory (no embedding needed) ───────────────────────────────
+    st_payload = {
+        "sku":                       sku,
+        "location":                  location,
+        "decided_at":                decided_at.isoformat(),
+        "supplier_name":             supplier,
+        "supplier_id":               supplier_id,
+        "quantity":                  quantity,
+        "confidence":                confidence,
+        "days_of_stock_at_decision": None,
+        "auto_approved":             False,
+        "decided_by":                "human",
+        "human_decision":            decision,
+        "rationale_summary":         rationale,
+    }
     try:
-        _db.short_term_memory.insert_one({
-            "sku":                       sku,
-            "location":                  location,
-            "decided_at":                decided_at,
-            "supplier_name":             supplier,
-            "supplier_id":               supplier_id,
-            "quantity":                  quantity,
-            "confidence":                confidence,
-            "days_of_stock_at_decision": None,   # not available from order doc alone
-            "auto_approved":             False,
-            "decided_by":                "human",
-            "human_decision":            decision,
-            "rationale_summary":         rationale,
-        })
+        _db.short_term_memory.insert_one({**st_payload, "decided_at": decided_at})
     except Exception as exc:
-        print(f"  [WARN] Human short-term memory write failed: {exc}")
+        _record_failed_memory_write(sku, location, "short_term", exc, st_payload)
 
     # ── Long-term memory (embedded) ───────────────────────────────────────────
-    action_phrase = (
-        f"Human APPROVED order" if decision == "approved"
-        else f"Human REJECTED order"
-    )
+    action_phrase = "Human APPROVED order" if decision == "approved" else "Human REJECTED order"
     content = (
         f"{action_phrase} for {sku} at {location}: {quantity} units from {supplier} "
         f"(agent confidence: {confidence}, total cost: ${total_cost:,.0f}). "
         f"{'Rationale: ' + rationale if rationale else 'No rationale recorded.'}"
     )
+    lt_payload = {
+        "sku":            sku,
+        "location":       location,
+        "content":        content,
+        "confidence":     confidence,
+        "auto_approved":  False,
+        "decided_by":     "human",
+        "human_decision": decision,
+        "created_at":     decided_at.isoformat(),
+    }
     try:
         embedding = _get_embedding(content)
         _db.agent_memory.insert_one({
-            "sku":             sku,
-            "location":        location,
-            "content":         content,
-            "embedding":       embedding,
-            "confidence":      confidence,
-            "auto_approved":   False,
-            "decided_by":      "human",
-            "human_decision":  decision,
-            "created_at":      decided_at,
+            **lt_payload,
+            "embedding":  embedding,
+            "created_at": decided_at,
         })
     except Exception as exc:
-        print(f"  [WARN] Human long-term memory write failed: {exc}")
+        _record_failed_memory_write(sku, location, "long_term", exc, lt_payload)
+
+
+# ---------------------------------------------------------------------------
+# @tool wrappers for memory reads — used by the ReAct retrieval agent so the
+# LLM can call these as tools during its tool-calling loop.
+# The underlying functions remain callable directly for backward compatibility.
+# ---------------------------------------------------------------------------
+
+@tool
+def get_recent_decisions(sku: str, location: str) -> list:
+    """Get recent agent and human decisions for this SKU+location from the last 24 hours.
+    Returns up to 5 entries including supplier choice, quantity, confidence level, and
+    whether a human approved or rejected the order. Check this before recommending to
+    avoid duplicating an in-flight order or repeating a rejected supplier."""
+    return get_short_term_memories(sku, location)
+
+
+@tool
+def get_learned_patterns(situation_description: str) -> list:
+    """Retrieve semantically similar past procurement patterns from long-term memory.
+    Provide a plain-English description of the current situation (SKU, location,
+    urgency level, stock level, and category) to find relevant historical decisions
+    and their outcomes. Returns entries scored by semantic similarity."""
+    return get_long_term_memories(situation_description)
+
+
+# ---------------------------------------------------------------------------
+# Recommendation validator — called by the audit_agent node (not an @tool)
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Episodic memory — alert_lifecycle collection
+# Tracks the full event timeline for every alert (create → decision → outcome)
+# ---------------------------------------------------------------------------
+
+def append_lifecycle_event(
+    alert_id: str,
+    event_type: str,
+    payload: dict | None = None,
+    sku: str = "",
+    location: str = "",
+) -> None:
+    """Append a timestamped event to the alert's lifecycle document.
+
+    Creates the document on first call for an alert_id (upsert).
+    event_type values: alert_created, agent_decision, human_approved,
+                       human_rejected, order_placed, stock_recovered
+    """
+    try:
+        oid = ObjectId(alert_id)
+    except Exception:
+        oid = alert_id  # type: ignore[assignment]
+
+    event = {"type": event_type, "at": datetime.now(timezone.utc), **(payload or {})}
+    try:
+        _db.alert_lifecycle.update_one(
+            {"alert_id": oid},
+            {
+                "$push": {"events": event},
+                "$setOnInsert": {
+                    "alert_id": oid,
+                    "sku":      sku,
+                    "location": location,
+                },
+            },
+            upsert=True,
+        )
+    except Exception as exc:
+        log.warning("append_lifecycle_event failed", extra={
+            "event_type": event_type, "error": str(exc),
+        })
+
+
+@tool
+def get_applicable_procedures(sku_category: str, location: str) -> list:
+    """Fetch human-confirmed procedural preference rules for a given category and location.
+
+    These rules encode learned preferences derived from repeated approval patterns
+    (e.g., 'always prefer Supplier X for surgical supplies at Location A').
+    Only human-confirmed rules are returned — candidate rules pending review are excluded.
+    Use these as strong prior preferences when all else is equal.
+    """
+    try:
+        rules = _json_safe(list(_db.procedures.find(
+            {
+                "sku_category": sku_category,
+                "location":     location,
+                "human_confirmed": True,
+            },
+            {"_id": 0, "preferred_supplier_id": 1, "preferred_supplier_name": 1,
+             "condition": 1, "evidence_count": 1, "last_updated": 1},
+            sort=[("evidence_count", -1)],
+            limit=5,
+        )))
+        return rules if rules else [
+            {"info": f"No confirmed procedural rules for {sku_category} @ {location}"}
+        ]
+    except Exception as exc:
+        return [{"error": f"Procedures unavailable: {exc}"}]
+
+
+@tool
+def get_episode_history(sku: str, location: str, limit: int = 3) -> list:
+    """Fetch recent full alert lifecycle episodes for this SKU+location.
+
+    Each episode shows the complete sequence of events from alert creation
+    through human decision and stock recovery, so you can see what actually
+    happened in past procurement cycles and whether orders resolved the gap.
+    """
+    try:
+        episodes = _json_safe(list(_db.alert_lifecycle.find(
+            {"sku": sku, "location": location},
+            {"_id": 0},
+            sort=[("events.0.at", -1)],
+            limit=limit,
+        )))
+        return episodes if episodes else [
+            {"info": f"No lifecycle episodes found for {sku} @ {location}"}
+        ]
+    except Exception as exc:
+        return [{"error": f"Episode history unavailable: {exc}"}]
+
+
+# ---------------------------------------------------------------------------
+# Recommendation validator (called by audit_agent node, not an @tool)
+# ---------------------------------------------------------------------------
+
+def validate_recommendation(rec: dict, state: dict) -> list:
+    """Validate a procurement recommendation against schema and business rules.
+
+    Returns a list of error strings. An empty list means the recommendation is valid.
+    """
+    errors: list = []
+
+    # ── Schema: required fields must be present and non-None ─────────────
+    # supplier_id/supplier_name may be None on the zero-gap fast path (quantity=0).
+    zero_gap = state.get("coverage_gap") == 0
+    required = ["supplier_id", "supplier_name", "quantity", "rationale", "confidence"]
+    for field in required:
+        allow_none = zero_gap and field in ("supplier_id", "supplier_name")
+        if field not in rec or (rec[field] is None and not allow_none):
+            errors.append(f"Missing required field: '{field}'")
+
+    if errors:
+        return errors  # type/business checks are meaningless if schema is broken
+
+    # ── Types ──────────────────────────────────────────────────────────────
+    try:
+        qty = int(rec["quantity"])
+        if qty < 0:
+            errors.append(f"'quantity' must be >= 0, got {qty}")
+    except (ValueError, TypeError):
+        errors.append(f"'quantity' must be an integer, got {rec['quantity']!r}")
+        qty = -1
+
+    if str(rec.get("confidence", "")).lower() not in {"high", "medium", "low"}:
+        errors.append(
+            f"'confidence' must be 'high', 'medium', or 'low'; got {rec.get('confidence')!r}"
+        )
+
+    if len(str(rec.get("rationale", "")).strip()) < 10:
+        errors.append("'rationale' is too short (minimum 10 characters required)")
+
+    # ── Business rules ─────────────────────────────────────────────────────
+    coverage_gap = state.get("coverage_gap")
+    if coverage_gap == 0 and qty != 0:
+        errors.append(
+            f"coverage_gap is 0 (existing orders are sufficient) but quantity={qty} — "
+            "must return quantity = 0 when the gap is already closed"
+        )
+
+    return errors

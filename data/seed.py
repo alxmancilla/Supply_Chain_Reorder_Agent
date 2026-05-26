@@ -45,10 +45,11 @@ EMBEDDING_DIMS = 1024
 # ---------------------------------------------------------------------------
 SKUS = [
     {
+        # Above reorder point — healthy stock
         "sku": "MED-2041",
         "name": "Amoxicillin 500mg Capsules",
         "location": "DC-Ohio",
-        "on_hand": 142,
+        "on_hand": 320,
         "on_order": 0,
         "reorder_point": 200,
         "safety_stock": 80,
@@ -56,10 +57,11 @@ SKUS = [
         "category": "pharmaceutical",
     },
     {
+        # Above reorder point — healthy stock
         "sku": "MED-3017",
         "name": "Insulin Glargine",
         "location": "DC-Texas",
-        "on_hand": 890,
+        "on_hand": 1350,
         "on_order": 0,
         "reorder_point": 1000,
         "safety_stock": 300,
@@ -67,6 +69,7 @@ SKUS = [
         "category": "pharmaceutical",
     },
     {
+        # Below reorder point (~55%) — triggers alert immediately (1 of 3)
         "sku": "SURG-0084",
         "name": "Nitrile Gloves (box)",
         "location": "DC-Ohio",
@@ -78,10 +81,11 @@ SKUS = [
         "category": "surgical",
     },
     {
+        # Above reorder point — healthy stock
         "sku": "SURG-1122",
         "name": "IV Bags 1L",
         "location": "DC-Texas",
-        "on_hand": 310,
+        "on_hand": 680,
         "on_order": 0,
         "reorder_point": 500,
         "safety_stock": 150,
@@ -89,7 +93,7 @@ SKUS = [
         "category": "surgical",
     },
     {
-        # Intentionally above reorder point — agent should leave this alone
+        # Above reorder point — intentionally well-stocked
         "sku": "MED-4490",
         "name": "Metformin 1000mg",
         "location": "DC-Ohio",
@@ -101,6 +105,7 @@ SKUS = [
         "category": "pharmaceutical",
     },
     {
+        # Below reorder point (~42%) — triggers alert immediately (2 of 3)
         "sku": "MED-5502",
         "name": "Vancomycin 1g IV",
         "location": "DC-California",
@@ -112,6 +117,7 @@ SKUS = [
         "category": "pharmaceutical",
     },
     {
+        # Below reorder point (~75%) — triggers alert immediately (3 of 3)
         "sku": "MED-6201",
         "name": "Heparin Sodium 5000U/mL",
         "location": "DC-Texas",
@@ -123,10 +129,11 @@ SKUS = [
         "category": "pharmaceutical",
     },
     {
+        # Above reorder point — healthy stock
         "sku": "DIAG-0331",
         "name": "Rapid COVID/Flu Combo Test Kit",
         "location": "DC-Ohio",
-        "on_hand": 320,
+        "on_hand": 680,
         "on_order": 0,
         "reorder_point": 500,
         "safety_stock": 150,
@@ -134,10 +141,11 @@ SKUS = [
         "category": "diagnostic",
     },
     {
+        # Above reorder point — healthy stock
         "sku": "SURG-2244",
         "name": "N95 Respirator Mask",
         "location": "DC-California",
-        "on_hand": 180,
+        "on_hand": 580,
         "on_order": 0,
         "reorder_point": 400,
         "safety_stock": 120,
@@ -145,10 +153,11 @@ SKUS = [
         "category": "surgical",
     },
     {
+        # Above reorder point — healthy stock
         "sku": "LAB-0112",
         "name": "Aerobic Blood Culture Bottle",
         "location": "DC-Texas",
-        "on_hand": 240,
+        "on_hand": 580,
         "on_order": 0,
         "reorder_point": 400,
         "safety_stock": 100,
@@ -952,6 +961,7 @@ def seed_order_history() -> None:
     print("Seeding order_history with embeddings (Vector Search) …")
     db.order_history.drop()
     db.order_history.create_index([("sku", ASCENDING)])
+    db.order_history.create_index([("proposed_order_id", ASCENDING)])
 
     docs = []
     failed = 0
@@ -1002,6 +1012,27 @@ def seed_clear_alerts_and_orders() -> None:
     # Reset simulator control state so the demo starts in "running" mode
     db.simulator_control.update_one(
         {"_id": "main"}, {"$set": {"state": "running", "speed": 1}}, upsert=True
+    )
+    # Clear Phase-2/3/4 operational collections so demo starts clean
+    for coll in (
+        "alert_lifecycle",
+        "confidence_outcomes",
+        "escalation_queue",
+        "failed_memory_writes",
+        "human_review_queue",
+        "dead_letter_events",
+        "procedures",
+    ):
+        db[coll].drop()
+    # Ensure lightweight indexes on commonly-queried fields
+    db.alert_lifecycle.create_index([("sku", ASCENDING), ("location", ASCENDING)])
+    db.confidence_outcomes.create_index([("alert_id", ASCENDING)])
+    db.confidence_outcomes.create_index([("predicted_confidence", ASCENDING), ("outcome", ASCENDING)])
+    db.escalation_queue.create_index([("sku", ASCENDING), ("location", ASCENDING)])
+    db.failed_memory_writes.create_index([("resolved", ASCENDING), ("retry_count", ASCENDING)])
+    # get_applicable_procedures queries (sku_category, location, human_confirmed)
+    db.procedures.create_index(
+        [("sku_category", ASCENDING), ("location", ASCENDING), ("human_confirmed", ASCENDING)]
     )
     print("  Done")
 
