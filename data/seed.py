@@ -1037,6 +1037,46 @@ def seed_clear_alerts_and_orders() -> None:
     print("  Done")
 
 
+def seed_initial_alerts() -> None:
+    """Create reorder_alerts for any SKU already below its reorder point at seed time.
+
+    This ensures the agent has work to process immediately after the demo starts,
+    without waiting for the simulator to drain stock further.  The alert schema
+    mirrors what stream_simulator.py produces so the agent processes them identically.
+    """
+    print("Creating initial alerts for below-reorder-point SKUs …")
+    alerts = []
+    now = datetime.now(timezone.utc)
+    for sku_doc in SKUS:
+        sku       = sku_doc["sku"]
+        on_hand   = sku_doc["on_hand"]
+        on_order  = sku_doc["on_order"]
+        reorder   = sku_doc["reorder_point"]
+        if on_hand + on_order >= reorder:
+            continue
+        avg_daily = AVG_DAILY.get(sku, 1)
+        days_remaining = round(on_hand / avg_daily, 1) if avg_daily > 0 else 0.0
+        alerts.append({
+            "sku":                      sku,
+            "location":                 sku_doc["location"],
+            "on_hand":                  on_hand,
+            "on_order":                 on_order,
+            "reorder_point":            reorder,
+            "units_consumed_last_15min": 0,
+            "avg_daily_consumption":    avg_daily,
+            "days_of_stock_remaining":  days_remaining,
+            "status":                   "pending",
+            "created_at":               now,
+        })
+        print(f"  Alert → {sku} @ {sku_doc['location']}: "
+              f"on_hand={on_hand}, reorder_pt={reorder}, days_left={days_remaining}")
+    if alerts:
+        db.reorder_alerts.insert_many(alerts)
+        print(f"  Inserted {len(alerts)} initial alert(s)")
+    else:
+        print("  No SKUs below reorder point — no alerts created")
+
+
 def create_atlas_indexes() -> None:
     """
     Create Atlas Search index (suppliers), Vector Search index (order_history),
@@ -1199,5 +1239,6 @@ if __name__ == "__main__":
         print("  Fix the Voyage AI credentials and re-run seed.py to add embeddings.")
     seed_clear_alerts_and_orders()
     create_atlas_indexes()
+    seed_initial_alerts()
     print("\nSeed complete.")
     print("Run 'python simulator/stream_simulator.py' and 'python agent/graph.py' to start the demo.")

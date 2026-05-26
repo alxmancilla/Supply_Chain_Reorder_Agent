@@ -1043,6 +1043,29 @@ async def _process_one_alert(alert_doc: dict) -> None:
         await sku_lock.release(_db_async, sku, location, alert_id)
 
 
+async def _drain_existing_pending_alerts() -> None:
+    """Process any pending alerts that existed before the Change Stream opened.
+
+    Change Streams only deliver events that occur after the cursor is opened, so
+    alerts inserted by seed.py (or a prior agent crash) are invisible to the stream.
+    This scan runs once on startup to close that gap.  The atomic pending→processing
+    claim inside _process_one_alert prevents any alert from being double-processed.
+    """
+    cursor = _db_async.reorder_alerts.find({"status": "pending"})
+    count = 0
+    async for alert_doc in cursor:
+        sku = alert_doc.get("sku", "?")
+        log.info("startup: processing pre-existing pending alert", extra={"sku": sku})
+        try:
+            await _process_one_alert(alert_doc)
+            count += 1
+        except Exception as exc:  # noqa: BLE001
+            log.error("startup: error processing pre-existing alert",
+                       extra={"sku": sku, "error": str(exc)})
+    if count:
+        log.info("startup: drained pre-existing pending alerts", extra={"count": count})
+
+
 async def watch_alerts() -> None:
     """Watch reorder_alerts via Change Stream and invoke the agent graph.
 
@@ -1060,6 +1083,8 @@ async def watch_alerts() -> None:
 
     await sku_lock.ensure_indexes(_db_async)
     log.info("sku_processing_locks indexes ensured")
+
+    await _drain_existing_pending_alerts()
 
     while True:
         resume_token = _load_resume_token()

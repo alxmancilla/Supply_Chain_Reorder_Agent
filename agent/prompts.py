@@ -451,6 +451,8 @@ def _fmt_short_term(m: dict) -> str:
 
     decided = m.get("decided_at")
     if decided:
+        if isinstance(decided, str):
+            decided = dt.fromisoformat(decided)
         decided = decided.replace(tzinfo=tz.utc) if decided.tzinfo is None else decided
         delta   = dt.now(tz.utc) - decided
         age_str = f"{int(delta.total_seconds() // 3600)}h {int((delta.total_seconds() % 3600) // 60)}m"
