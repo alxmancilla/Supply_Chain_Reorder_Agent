@@ -27,7 +27,7 @@ log = get_logger(__name__)
 
 _client = MongoClient(
     os.environ["MONGODB_URI"],
-    serverSelectionTimeoutMS=5_000,
+    serverSelectionTimeoutMS=30_000,
     connectTimeoutMS=10_000,
     socketTimeoutMS=30_000,
 )
@@ -166,21 +166,88 @@ def get_consumption_trend(sku: str, location: str, days: int = 14) -> dict:
 @tool
 def search_suppliers_by_capability(query: str) -> list:
     """
-    Atlas Search: full-text search over supplier names and capability notes across
-    the entire supplier catalog. Returns suppliers ranked by relevance score.
-    Searching the whole catalog means the hit count varies (0–5) based on how many
-    suppliers have relevant capabilities for the current situation.
+    Atlas Hybrid Search: combines a supplier-name pipeline and a fuzzy capability-notes
+    pipeline via $rankFusion (Reciprocal Rank Fusion). RRF merges independent rank lists
+    rather than blending raw scores, so a supplier that ranks highly in either path rises
+    to the top without being drowned out by the other path's score distribution.
     Use this to find suppliers with specific capabilities (e.g. 'expedited cold-chain',
     'emergency pharmaceutical', 'fast PPE delivery').
     """
+    _proj = {
+        "_id": 0,
+        "supplier_id":           1,
+        "supplier_name":         1,
+        "sku":                   1,
+        "lead_time_days":        1,
+        "moq":                   1,
+        "unit_price":            1,
+        "fill_rate_pct":         1,
+        "on_time_delivery_pct":  1,
+        "notes":                 1,
+        "search_score":          1,
+    }
+
+    # Primary: $rankFusion — two independent $search pipelines merged via RRF.
+    # capability_match weighted higher (0.6) because the tool is primarily used
+    # for capability queries, not exact supplier-name lookups.
     pipeline = [
+        {
+            "$rankFusion": {
+                "input": {
+                    "pipelines": {
+                        "name_match": [
+                            {
+                                "$search": {
+                                    "index": "suppliers_text_search",
+                                    "text": {
+                                        "query": query,
+                                        "path":  "supplier_name",
+                                    },
+                                }
+                            }
+                        ],
+                        "capability_match": [
+                            {
+                                "$search": {
+                                    "index": "suppliers_text_search",
+                                    "text": {
+                                        "query": query,
+                                        "path":  "notes",
+                                        "fuzzy": {"maxEdits": 1},
+                                    },
+                                }
+                            }
+                        ],
+                    }
+                },
+                "combination": {
+                    "weights": {
+                        "name_match":       0.4,
+                        "capability_match": 0.6,
+                    }
+                },
+            }
+        },
+        {"$addFields": {"search_score": {"$meta": "searchScore"}}},
+        {"$project": _proj},
+        {"$limit": 5},
+    ]
+
+    try:
+        results = list(_db.suppliers.aggregate(pipeline))
+        return results if results else [{"info": f"No capability match for query '{query}'"}]
+    except Exception as exc:
+        # $rankFusion requires Atlas M10+; fall back to compound $search on
+        # older tiers or non-Atlas deployments.
+        log.warning(
+            "rankFusion unavailable, falling back to compound $search",
+            extra={"error": str(exc)},
+        )
+
+    fallback_pipeline = [
         {
             "$search": {
                 "index": "suppliers_text_search",
-                # compound operator: supplier_name matches score 3× higher than
-                # notes matches so exact name hits outrank fuzzy capability hits.
-                # sku is intentionally excluded — searching "cold-chain" should
-                # not accidentally match SKU strings.
                 "compound": {
                     "should": [
                         {
@@ -202,28 +269,14 @@ def search_suppliers_by_capability(query: str) -> list:
             }
         },
         {"$addFields": {"search_score": {"$meta": "searchScore"}}},
-        {
-            "$project": {
-                "_id": 0,
-                "supplier_id":           1,
-                "supplier_name":         1,
-                "sku":                   1,
-                "lead_time_days":        1,
-                "moq":                   1,
-                "unit_price":            1,
-                "fill_rate_pct":         1,
-                "on_time_delivery_pct":  1,
-                "notes":                 1,
-                "search_score":          1,
-            }
-        },
+        {"$project": _proj},
         {"$limit": 5},
     ]
 
     try:
-        results = list(_db.suppliers.aggregate(pipeline))
-    except Exception as exc:
-        return [{"error": f"Atlas Search unavailable: {exc}"}]
+        results = list(_db.suppliers.aggregate(fallback_pipeline))
+    except Exception as exc2:
+        return [{"error": f"Atlas Search unavailable: {exc2}"}]
 
     return results if results else [{"info": f"No capability match for query '{query}'"}]
 
@@ -747,5 +800,19 @@ def validate_recommendation(rec: dict, state: dict) -> list:
             f"coverage_gap is 0 (existing orders are sufficient) but quantity={qty} — "
             "must return quantity = 0 when the gap is already closed"
         )
+
+    # Regulatory: pharmaceutical and laboratory SKUs must use an FDA-registered supplier.
+    _FDA_REQUIRED = {"pharmaceutical", "laboratory"}
+    category = state.get("inventory", {}).get("category", "")
+    if category in _FDA_REQUIRED and not zero_gap:
+        chosen_id = rec.get("supplier_id")
+        suppliers  = state.get("suppliers", [])
+        chosen_sup = next((s for s in suppliers if s.get("supplier_id") == chosen_id), None)
+        if chosen_sup is not None and not chosen_sup.get("fda_registered", True):
+            errors.append(
+                f"Regulatory violation: '{chosen_sup.get('supplier_name', chosen_id)}' is not "
+                f"FDA-registered. {category.capitalize()} SKUs require an FDA-licensed wholesale "
+                "distributor (21 CFR Part 205). Choose a different supplier."
+            )
 
     return errors

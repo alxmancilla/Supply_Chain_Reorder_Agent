@@ -11,10 +11,11 @@ Layout:
 import os
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import streamlit as st
+from bson import ObjectId
 from dotenv import load_dotenv
 from streamlit_autorefresh import st_autorefresh
 from pymongo import MongoClient
@@ -76,7 +77,7 @@ st.set_page_config(
 def get_db():
     c = MongoClient(
         os.environ["MONGODB_URI"],
-        serverSelectionTimeoutMS=5_000,
+        serverSelectionTimeoutMS=30_000,
         connectTimeoutMS=10_000,
         socketTimeoutMS=30_000,
     )
@@ -86,9 +87,108 @@ def get_db():
 db = get_db()
 
 # ---------------------------------------------------------------------------
+# Persist human decisions across reruns (autorefresh race-condition fix)
+# ---------------------------------------------------------------------------
+# st.button() returns True only in the single rerun triggered by the click.
+# st_autorefresh fires every 5 s and can preempt that rerun, discarding the
+# click.  We store the action in session_state so it survives any rerun.
+_pending_procedure = st.session_state.pop("_pending_procedure_action", None)
+if _pending_procedure:
+    _pp_id     = ObjectId(_pending_procedure["rule_id_str"])
+    _pp_action = _pending_procedure["action"]
+    if _pp_action == "confirm":
+        db.procedures.update_one(
+            {"_id": _pp_id},
+            {"$set": {"human_confirmed": True, "last_updated": datetime.now(timezone.utc)}},
+        )
+        st.toast("✅ Rule confirmed — agent will now use this supplier preference.")
+    elif _pp_action == "dismiss":
+        db.procedures.delete_one({"_id": _pp_id})
+        st.toast("🗑 Rule dismissed.")
+
+_pending_decision = st.session_state.pop("_pending_human_decision", None)
+if _pending_decision:
+    _pd_oid        = ObjectId(_pending_decision["oid_str"])
+    _pd_action     = _pending_decision["action"]
+    _pd_alert_str  = _pending_decision.get("alert_id_str", "")
+    _pd_alert_id   = ObjectId(_pd_alert_str) if _pd_alert_str else None
+    _pd_order      = db.proposed_orders.find_one({"_id": _pd_oid})
+    if _pd_order and _pd_order.get("status") == "awaiting_approval":
+        if _pd_action == "approve":
+            db.proposed_orders.update_one({"_id": _pd_oid}, {"$set": {"status": "approved"}})
+            db.inventory.update_one(
+                {"sku": _pd_order["sku"], "location": _pd_order["location"]},
+                {"$inc": {"on_order": _pd_order["quantity_recommended"]}},
+            )
+            db.confidence_outcomes.update_one(
+                {"order_id": _pd_oid},
+                {"$set": {"human_decision": "approved", "outcome": "resolved"}},
+            )
+            db.order_history.update_one(
+                {"proposed_order_id": _pd_oid},
+                {"$set": {"outcome": "human_approved"}},
+            )
+            threading.Thread(
+                target=write_human_decision_memory,
+                args=(dict(_pd_order), "approved"),
+                daemon=True,
+            ).start()
+            threading.Thread(
+                target=append_lifecycle_event,
+                args=(
+                    str(_pd_order.get("alert_id", "")), "human_approved",
+                    {"order_id": str(_pd_oid)},
+                    _pd_order.get("sku", ""), _pd_order.get("location", ""),
+                ),
+                daemon=True,
+            ).start()
+            st.toast(
+                f"✅ Approved — {_pd_order.get('quantity_recommended', 0):,} units"
+                f" from {_pd_order.get('supplier_name', 'supplier')}"
+                f" ({_pd_order.get('sku', '')} @ {_pd_order.get('location', '')})"
+            )
+        elif _pd_action == "reject":
+            db.proposed_orders.update_one({"_id": _pd_oid}, {"$set": {"status": "rejected"}})
+            db.confidence_outcomes.update_one(
+                {"order_id": _pd_oid},
+                {"$set": {"human_decision": "rejected", "outcome": "escalated"}},
+            )
+            db.order_history.update_one(
+                {"proposed_order_id": _pd_oid},
+                {"$set": {"outcome": "rejected"}},
+            )
+            if _pd_alert_id:
+                db.reorder_alerts.update_one(
+                    {"_id": _pd_alert_id},
+                    {
+                        "$set":   {"status": "pending"},
+                        "$unset": {"order_id": ""},
+                        "$inc":   {"rejection_count": 1},
+                    },
+                )
+            threading.Thread(
+                target=write_human_decision_memory,
+                args=(dict(_pd_order), "rejected"),
+                daemon=True,
+            ).start()
+            threading.Thread(
+                target=append_lifecycle_event,
+                args=(
+                    str(_pd_order.get("alert_id", "")), "human_rejected",
+                    {"order_id": str(_pd_oid)},
+                    _pd_order.get("sku", ""), _pd_order.get("location", ""),
+                ),
+                daemon=True,
+            ).start()
+            st.toast(
+                f"❌ Rejected — {_pd_order.get('sku', '')} @ {_pd_order.get('location', '')}"
+                " reset for reprocessing."
+            )
+
+# ---------------------------------------------------------------------------
 # Auto-refresh interval
 # ---------------------------------------------------------------------------
-REFRESH_INTERVAL = 5  # seconds
+REFRESH_INTERVAL = 10  # seconds
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -167,9 +267,9 @@ st.markdown("""
 <style>
 [data-testid="block-container"] { padding-top: 0.75rem; }
 
-/* Top bar */
+/* Top bar — MongoDB Forest → Evergreen gradient */
 .top-bar {
-    background: linear-gradient(135deg, #1a1f2e 0%, #2d3748 100%);
+    background: linear-gradient(135deg, #001E2B 0%, #023430 100%);
     border-radius: 10px; padding: 14px 20px; margin-bottom: 14px;
     display: flex; align-items: center; justify-content: space-between;
 }
@@ -177,13 +277,13 @@ st.markdown("""
 .tech-pill {
     display: inline-block; font-size: 0.6rem; font-weight: 700;
     padding: 2px 8px; border-radius: 20px; margin-left: 6px;
-    background: #4a5568; color: #e2e8f0;
+    background: #1C2D38; color: #E8EDEB;
 }
-.tech-pill.mongo { background: #00684a; color: #00ed64; }
-.live-indicator { color: #a0aec0; font-size: 0.78rem; text-align: right; line-height: 1.6; }
+.tech-pill.mongo { background: #00684A; color: #00ED64; }
+.live-indicator { color: #889397; font-size: 0.78rem; text-align: right; line-height: 1.6; }
 .live-dot {
     display: inline-block; width: 8px; height: 8px;
-    background: #00ed64; border-radius: 50%; margin-right: 5px;
+    background: #00ED64; border-radius: 50%; margin-right: 5px;
     animation: blink 1.8s ease-in-out infinite;
 }
 @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
@@ -192,59 +292,59 @@ st.markdown("""
 .kpi-row { display: flex; gap: 10px; margin-bottom: 16px; }
 .kpi-card {
     flex: 1; background: #fff; border-radius: 10px;
-    padding: 14px 18px; box-shadow: 0 1px 4px rgba(0,0,0,.07);
-    border-top: 3px solid #e2e8f0;
+    padding: 14px 18px; box-shadow: 0 1px 4px rgba(0,30,43,.08);
+    border-top: 3px solid #E8EDEB;
 }
 .kpi-card.red   { border-top-color: #e53e3e; }
 .kpi-card.amber { border-top-color: #d69e2e; }
-.kpi-card.green { border-top-color: #38a169; }
-.kpi-card.blue  { border-top-color: #3182ce; }
-.kpi-lbl { font-size: 0.7rem; font-weight: 600; color: #718096; text-transform: uppercase; letter-spacing:.06em; }
-.kpi-val { font-size: 1.9rem; font-weight: 800; color: #1a202c; line-height: 1.15; }
-.kpi-sub { font-size: 0.7rem; color: #a0aec0; }
+.kpi-card.green { border-top-color: #00ED64; }
+.kpi-card.blue  { border-top-color: #00684A; }
+.kpi-lbl { font-size: 0.7rem; font-weight: 600; color: #5C6C75; text-transform: uppercase; letter-spacing:.06em; }
+.kpi-val { font-size: 1.9rem; font-weight: 800; color: #001E2B; line-height: 1.15; }
+.kpi-sub { font-size: 0.7rem; color: #889397; }
 
 /* Panel headings */
 .panel-hdr {
-    font-size: 0.72rem; font-weight: 700; color: #4a5568;
+    font-size: 0.72rem; font-weight: 700; color: #1C2D38;
     text-transform: uppercase; letter-spacing: .08em;
-    padding-bottom: 6px; border-bottom: 2px solid #e2e8f0; margin-bottom: 10px;
+    padding-bottom: 6px; border-bottom: 2px solid #00684A; margin-bottom: 10px;
 }
 
 /* Inventory cards */
 .inv-card {
     background: #fff; border-radius: 10px; padding: 12px 14px;
-    margin-bottom: 10px; box-shadow: 0 1px 3px rgba(0,0,0,.06);
-    border-left: 4px solid #38a169;
+    margin-bottom: 10px; box-shadow: 0 1px 3px rgba(0,30,43,.07);
+    border-left: 4px solid #00ED64;
 }
 .inv-card.crit { border-left-color: #e53e3e; }
-.inv-sku  { font-size: 0.7rem; font-weight: 700; color: #718096; }
-.inv-name { font-size: 0.86rem; font-weight: 600; color: #1a202c; line-height: 1.2; }
-.inv-loc  { font-size: 0.67rem; color: #a0aec0; margin-bottom: 6px; }
-.bar-bg   { background: #edf2f7; border-radius: 3px; height: 5px; margin: 6px 0 2px; }
+.inv-sku  { font-size: 0.7rem; font-weight: 700; color: #5C6C75; }
+.inv-name { font-size: 0.86rem; font-weight: 600; color: #001E2B; line-height: 1.2; }
+.inv-loc  { font-size: 0.67rem; color: #889397; margin-bottom: 6px; }
+.bar-bg   { background: #E8EDEB; border-radius: 3px; height: 5px; margin: 6px 0 2px; }
 .bar-fill { height: 5px; border-radius: 3px; }
 .inv-nums { display: flex; gap: 10px; margin-top: 6px; flex-wrap: wrap; }
 .inv-n    { text-align: center; }
-.inv-nv   { font-size: 0.85rem; font-weight: 700; color: #2d3748; }
-.inv-nl   { font-size: 0.58rem; color: #a0aec0; text-transform: uppercase; }
+.inv-nv   { font-size: 0.85rem; font-weight: 700; color: #1C2D38; }
+.inv-nl   { font-size: 0.58rem; color: #889397; text-transform: uppercase; }
 
 /* Feed cards (alerts + decisions) */
 .feed-card {
     background: #fff; border-radius: 10px; padding: 12px 14px;
-    margin-bottom: 10px; box-shadow: 0 1px 3px rgba(0,0,0,.06);
-    border-left: 4px solid #e2e8f0;
+    margin-bottom: 10px; box-shadow: 0 1px 3px rgba(0,30,43,.07);
+    border-left: 4px solid #E8EDEB;
 }
 .feed-card.crit   { border-left-color: #e53e3e; }
 .feed-card.high   { border-left-color: #dd6b20; }
 .feed-card.medium { border-left-color: #d69e2e; }
-.feed-card.ok     { border-left-color: #38a169; }
-.feed-card.teal   { border-left-color: #319795; }
+.feed-card.ok     { border-left-color: #00ED64; }
+.feed-card.teal   { border-left-color: #00684A; }
 .feed-hdr  { display: flex; justify-content: space-between; align-items: flex-start; }
-.feed-sku  { font-size: 0.88rem; font-weight: 700; color: #1a202c; }
-.feed-loc  { font-size: 0.72rem; color: #718096; }
-.feed-age  { font-size: 0.68rem; color: #a0aec0; white-space: nowrap; }
+.feed-sku  { font-size: 0.88rem; font-weight: 700; color: #001E2B; }
+.feed-loc  { font-size: 0.72rem; color: #5C6C75; }
+.feed-age  { font-size: 0.68rem; color: #889397; white-space: nowrap; }
 .feed-nums { display: flex; gap: 14px; margin-top: 8px; flex-wrap: wrap; }
-.feed-nv   { font-size: 0.88rem; font-weight: 700; color: #2d3748; }
-.feed-nl   { font-size: 0.62rem; color: #a0aec0; text-transform: uppercase; }
+.feed-nv   { font-size: 0.88rem; font-weight: 700; color: #1C2D38; }
+.feed-nl   { font-size: 0.62rem; color: #889397; text-transform: uppercase; }
 
 /* Badges */
 .badge {
@@ -255,10 +355,11 @@ st.markdown("""
 .b-crit   { background:#fed7d7; color:#9b2c2c; }
 .b-high   { background:#feebc8; color:#7b341e; }
 .b-med    { background:#fefcbf; color:#744210; }
-.b-ok     { background:#c6f6d5; color:#22543d; }
-.b-info   { background:#bee3f8; color:#2a4365; }
+.b-ok     { background:#CDFEE8; color:#023430; }
+.b-info   { background:#E8EDEB; color:#1C2D38; }
 .b-purple { background:#e9d8fd; color:#44337a; }
-.b-teal   { background:#b2f5ea; color:#234e52; }
+.b-teal   { background:#CDFEE8; color:#00684A; }
+.b-amber  { background:#feebc8; color:#7b341e; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -310,7 +411,7 @@ with st.sidebar:
 
     st.divider()
     st.header("🔍 Supplier Search")
-    st.caption("Powered by **Atlas Search** — full-text across supplier capability notes")
+    st.caption("Powered by **Atlas $rankFusion** — hybrid name + capability search via RRF")
 
     # ── Use st.form so the auto-refresh (st.rerun every 10 s) cannot clear ──
     # the user's mid-type input.  Form widgets buffer their state and only      ──
@@ -336,47 +437,94 @@ with st.sidebar:
     search_query = st.session_state.supplier_search_query
 
     if search_query:
-        # ── Primary: Atlas Search (full-text + fuzzy) ────────────────────
+        # ── Primary: $rankFusion — two independent $search pipelines merged via RRF ──
+        # name_match (precision) + capability_match (fuzzy recall), weighted 40/60.
+        # Falls back to compound $search if $rankFusion is unavailable (M0/M2/M5 tiers).
         atlas_results = []
         atlas_error   = None
+        _sidebar_proj = {
+            "_id": 0, "supplier_name": 1, "supplier_id": 1,
+            "sku": 1, "lead_time_days": 1, "fill_rate_pct": 1,
+            "unit_price": 1, "notes": 1, "score": 1,
+        }
         try:
             pipeline = [
                 {
-                    "$search": {
-                        "index": "suppliers_text_search",
-                        "compound": {
-                            "should": [
-                                {
-                                    "text": {
-                                        "query": search_query,
-                                        "path":  "supplier_name",
-                                        "score": {"boost": {"value": 3}},
+                    "$rankFusion": {
+                        "input": {
+                            "pipelines": {
+                                "name_match": [
+                                    {
+                                        "$search": {
+                                            "index": "suppliers_text_search",
+                                            "text": {
+                                                "query": search_query,
+                                                "path":  "supplier_name",
+                                            },
+                                        }
                                     }
-                                },
-                                {
-                                    "text": {
-                                        "query": search_query,
-                                        "path":  "notes",
-                                        "fuzzy": {"maxEdits": 1},
+                                ],
+                                "capability_match": [
+                                    {
+                                        "$search": {
+                                            "index": "suppliers_text_search",
+                                            "text": {
+                                                "query": search_query,
+                                                "path":  "notes",
+                                                "fuzzy": {"maxEdits": 1},
+                                            },
+                                        }
                                     }
-                                },
-                            ]
+                                ],
+                            }
+                        },
+                        "combination": {
+                            "weights": {
+                                "name_match":       0.4,
+                                "capability_match": 0.6,
+                            }
                         },
                     }
                 },
                 {"$addFields": {"score": {"$meta": "searchScore"}}},
-                {
-                    "$project": {
-                        "_id": 0, "supplier_name": 1, "supplier_id": 1,
-                        "sku": 1, "lead_time_days": 1, "fill_rate_pct": 1,
-                        "unit_price": 1, "notes": 1, "score": 1,
-                    }
-                },
+                {"$project": _sidebar_proj},
                 {"$limit": 8},
             ]
             atlas_results = list(db.suppliers.aggregate(pipeline))
-        except Exception as exc:
-            atlas_error = exc
+        except Exception:
+            # $rankFusion not available — try compound $search
+            try:
+                pipeline = [
+                    {
+                        "$search": {
+                            "index": "suppliers_text_search",
+                            "compound": {
+                                "should": [
+                                    {
+                                        "text": {
+                                            "query": search_query,
+                                            "path":  "supplier_name",
+                                            "score": {"boost": {"value": 3}},
+                                        }
+                                    },
+                                    {
+                                        "text": {
+                                            "query": search_query,
+                                            "path":  "notes",
+                                            "fuzzy": {"maxEdits": 1},
+                                        }
+                                    },
+                                ]
+                            },
+                        }
+                    },
+                    {"$addFields": {"score": {"$meta": "searchScore"}}},
+                    {"$project": _sidebar_proj},
+                    {"$limit": 8},
+                ]
+                atlas_results = list(db.suppliers.aggregate(pipeline))
+            except Exception as exc:
+                atlas_error = exc
 
         # ── Fallback: regex search when Atlas Search errors or returns nothing ──
         if atlas_error or not atlas_results:
@@ -397,10 +545,11 @@ with st.sidebar:
                 st.warning(f"Atlas Search unavailable — showing regex results.\n\n`{atlas_error}`")
         else:
             results   = atlas_results
-            src_label = "🔍 Atlas Search"
+            src_label = "🔀 $rankFusion"
 
         if results:
             st.success(f"{len(results)} supplier(s) matched  ·  {src_label}")
+
             for r in results:
                 with st.container(border=True):
                     rc1, rc2 = st.columns([3, 1])
@@ -424,7 +573,7 @@ with st.sidebar:
         st.info("Type a capability and press **Search** (or Enter).")
 
     st.divider()
-    st.caption("Atlas Search index: `suppliers_text_search`")
+    st.caption("Atlas Search index: `suppliers_text_search` · hybrid via `$rankFusion`")
     st.caption("Atlas Vector Search index: `order_history_vector_index`")
 
     # ── Demo Status ───────────────────────────────────────────────────────
@@ -449,7 +598,7 @@ with st.sidebar:
     # ── Reset Demo ────────────────────────────────────────────────────────
     st.divider()
     st.subheader("🔄 Reset Demo")
-    st.caption("Clears alerts, orders, memory and checkpoints. Inventory and suppliers are kept.")
+    st.caption("Clears alerts, orders, short-term memory and checkpoints. Inventory, suppliers, and long-term agent memory are preserved.")
     if st.button("🔄 Reset Demo", type="primary", use_container_width=True):
         # Clear all operational collections
         db.reorder_alerts.drop()
@@ -462,7 +611,6 @@ with st.sidebar:
         db.proposed_orders.create_index([("sku", 1), ("location", 1), ("status", 1)])
         db.proposed_orders.create_index([("created_at", 1)])
         db.short_term_memory.drop()
-        db.agent_memory.drop()
         db.checkpoints.drop()
         db.checkpoint_writes.drop()
         # Clear the Change Stream resume token — the reorder_alerts collection
@@ -508,6 +656,40 @@ with st.sidebar:
             except Exception as _exc:
                 st.error(f"Extraction failed: {_exc}")
 
+        # Procedure candidate review
+        _pending_rules = list(db.procedures.find(
+            {"human_confirmed": False},
+            {"sku_category": 1, "location": 1, "preferred_supplier_name": 1,
+             "preferred_supplier_id": 1, "evidence_count": 1, "created_at": 1},
+        ).sort("evidence_count", -1))
+        if _pending_rules:
+            with st.expander(f"📋 {len(_pending_rules)} candidate rule(s) awaiting confirmation", expanded=True):
+                st.caption("Rules are only passed to the agent after you confirm them.")
+                for _rule in _pending_rules:
+                    _rc, _rb = st.columns([5, 2])
+                    _rc.markdown(
+                        f"**{_rule['sku_category']}** @ `{_rule['location']}`  →  "
+                        f"**{_rule['preferred_supplier_name']}**  "
+                        f"*(ID: {_rule['preferred_supplier_id']}, "
+                        f"{_rule['evidence_count']} approvals)*"
+                    )
+                    _rb1, _rb2 = _rb.columns(2)
+                    _rule_id_str = str(_rule["_id"])
+                    if _rb1.button("✅", key=f"confirm_rule_{_rule_id_str}",
+                                   help="Confirm — agent will use this rule",
+                                   use_container_width=True):
+                        st.session_state["_pending_procedure_action"] = {
+                            "action": "confirm", "rule_id_str": _rule_id_str,
+                        }
+                        st.rerun()
+                    if _rb2.button("🗑", key=f"dismiss_rule_{_rule_id_str}",
+                                   help="Dismiss — delete this candidate",
+                                   use_container_width=True):
+                        st.session_state["_pending_procedure_action"] = {
+                            "action": "dismiss", "rule_id_str": _rule_id_str,
+                        }
+                        st.rerun()
+
         # Memory compaction
         st.caption("Deduplicate and summarize old agent memories (entries older than 30 days).")
         if st.button("🗜 Compact Memory", use_container_width=True):
@@ -515,11 +697,95 @@ with st.sidebar:
                 from agent.memory_compactor import run_compaction
                 result = run_compaction()
                 st.success(
-                    f"✅ Compaction done — {result.get('deduplicated', 0)} duplicates merged, "
+                    f"✅ Compaction done — {result.get('deduped', 0)} duplicates merged, "
                     f"{result.get('compacted', 0)} old entries summarized."
                 )
             except Exception as _exc:
                 st.error(f"Compaction failed: {_exc}")
+
+        # ── Agent Recovery via LangGraph Checkpoints ──────────────────────
+        # MongoDB persists LangGraph graph state node-by-node. If the agent
+        # process crashes mid-pipeline, the next alert re-invocation resumes
+        # from the last checkpoint rather than restarting from scratch.
+        st.divider()
+        st.caption("LangGraph checkpoints stored in MongoDB — enables crash recovery mid-pipeline.")
+        with st.expander("🔁 Agent Recovery Log", expanded=False):
+            _ckpt_rows = list(db.checkpoints.aggregate([
+                {"$sort": {"checkpoint_id": -1}},
+                {"$group": {
+                    "_id":                   "$thread_id",
+                    "latest_metadata":       {"$first": "$metadata"},
+                    "latest_checkpoint_id":  {"$first": "$checkpoint_id"},
+                    "total_steps":           {"$sum": 1},
+                }},
+                {"$sort": {"latest_checkpoint_id": -1}},
+                {"$limit": 10},
+            ]))
+
+            if not _ckpt_rows:
+                st.info("No checkpoints yet. Process an alert to generate pipeline state.")
+            else:
+                # Batch-fetch alert and order data for all thread_ids
+                _ck_alert_ids = []
+                for _cr in _ckpt_rows:
+                    try:
+                        _ck_alert_ids.append(ObjectId(_cr["_id"]))
+                    except Exception:
+                        pass
+                _ck_alert_map = {
+                    str(a["_id"]): a
+                    for a in db.reorder_alerts.find(
+                        {"_id": {"$in": _ck_alert_ids}},
+                        {"sku": 1, "location": 1, "status": 1},
+                    )
+                }
+                _ck_order_map = {
+                    str(o.get("alert_id", "")): o
+                    for o in db.proposed_orders.find(
+                        {"alert_id": {"$in": _ck_alert_ids}},
+                        {"alert_id": 1, "status": 1, "auto_approved": 1},
+                    )
+                }
+
+                _FULL_STEPS = 6  # typical completed run (assess → retrieve → analyse → recommend → audit → save)
+                st.caption(f"{len(_ckpt_rows)} recent pipeline run(s) · thread ID = alert `_id`")
+
+                for _cr in _ckpt_rows:
+                    _tid          = _cr["_id"]
+                    _ck_alert     = _ck_alert_map.get(_tid, {})
+                    _ck_order     = _ck_order_map.get(_tid, {})
+                    _ck_meta      = _cr.get("latest_metadata") or {}
+                    _ck_writes    = (_ck_meta.get("writes") or {}) if isinstance(_ck_meta, dict) else {}
+                    _last_node    = list(_ck_writes.keys())[0] if _ck_writes else "—"
+                    _steps        = _cr.get("total_steps", 0)
+                    _order_status = _ck_order.get("status")
+                    _alert_status = _ck_alert.get("status", "?")
+
+                    if _order_status in ("approved", "received", "awaiting_approval"):
+                        _ri, _rl, _rc = "✅", "completed", "#00684A"
+                    elif _order_status == "rejected":
+                        _ri, _rl, _rc = "🔄", "re-queued", "#d69e2e"
+                    elif _alert_status == "escalated":
+                        _ri, _rl, _rc = "🔺", "escalated", "#e53e3e"
+                    elif _alert_status in ("processing", "pending") and _steps < _FULL_STEPS:
+                        _ri, _rl, _rc = "⚡", "recovered on restart", "#d69e2e"
+                    else:
+                        _ri, _rl, _rc = "✅", "completed", "#00684A"
+
+                    _sku_lbl = _ck_alert.get("sku", f"{_tid[:8]}…")
+                    _loc_lbl = _ck_alert.get("location", "?")
+                    st.markdown(
+                        f'<div style="background:#f7f9f7;border-left:3px solid {_rc};'
+                        f'padding:7px 10px;border-radius:4px;margin-bottom:6px">'
+                        f'<span style="font-size:0.82rem;font-weight:700">{_ri} {_sku_lbl}</span>'
+                        f' <span style="font-size:0.7rem;color:#5C6C75">@ {_loc_lbl}</span>'
+                        f'<span style="float:right;font-size:0.66rem;color:#889397">'
+                        f'{_steps} steps · last: <code>{_last_node}</code></span>'
+                        f'<div style="font-size:0.64rem;color:#889397;margin-top:3px">'
+                        f'<code>{_tid[:20]}…</code> · alert: {_alert_status} · {_rl}'
+                        f'</div></div>',
+                        unsafe_allow_html=True,
+                    )
 
 # ---------------------------------------------------------------------------
 # Data fetching
@@ -544,9 +810,42 @@ _history_orders.sort(key=lambda o: (
 ))
 order_docs = _pending_orders + _history_orders
 
+# ROP health: avg daily consumption (last 30 days) and best-supplier lead time per SKU.
+# Two single-pass aggregations so the inventory loop has O(1) per-card lookup.
+_rop_cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+_avg_daily_map: dict = {
+    r["_id"]: round(r["avg_daily"], 1)
+    for r in db.consumption_history.aggregate([
+        {"$match": {"timestamp": {"$gte": _rop_cutoff}}},
+        {"$group": {
+            "_id":     "$sku",
+            "total":   {"$sum": "$quantity"},
+            "day_set": {"$addToSet": {
+                "$dateToString": {"format": "%Y-%m-%d", "date": "$timestamp"}
+            }},
+        }},
+        {"$project": {"avg_daily": {"$divide": ["$total", {"$size": "$day_set"}]}}},
+    ])
+}
+_lead_time_map: dict = {
+    r["_id"]: r["lead_time"]
+    for r in db.suppliers.aggregate([
+        {"$sort": {"fill_rate_pct": -1}},
+        {"$group": {"_id": "$sku", "lead_time": {"$first": "$lead_time_days"}}},
+    ])
+}
+
 # KPI aggregates — single $facet round-trip instead of multiple count_documents
 below_reorder  = sum(1 for i in inventory_docs if i["on_hand"] < i["reorder_point"])
 awaiting_count = sum(1 for o in order_docs if o.get("status") == "awaiting_approval")
+
+# Count SKUs whose ROP fires before the preferred supplier can deliver
+_rop_issues = sum(
+    1 for i in inventory_docs
+    if _avg_daily_map.get(i["sku"], 0) > 0
+    and _lead_time_map.get(i["sku"], 0) > 0
+    and (i["reorder_point"] / _avg_daily_map[i["sku"]]) < _lead_time_map[i["sku"]]
+)
 
 _order_kpis = list(db.proposed_orders.aggregate([
     {"$facet": {
@@ -578,12 +877,13 @@ st.markdown(f"""
     <span class="tech-pill">Voyage AI</span>
   </div>
   <div class="live-indicator">
-    <span class="live-dot"></span><strong style="color:#e2e8f0">LIVE</strong>
+    <span class="live-dot"></span><strong style="color:#E8EDEB">LIVE</strong>
     &nbsp;·&nbsp; {time.strftime('%H:%M:%S')}<br>
     Change Streams &nbsp;·&nbsp; Atlas Search &nbsp;·&nbsp; Vector Search
   </div>
 </div>
 """, unsafe_allow_html=True)
+
 
 # ---------------------------------------------------------------------------
 # KPI row
@@ -604,6 +904,11 @@ st.markdown(f"""
     <div class="kpi-lbl">⏳ Approval Queue</div>
     <div class="kpi-val">{awaiting_count}</div>
     <div class="kpi-sub">orders awaiting review</div>
+  </div>
+  <div class="kpi-card {"amber" if _rop_issues > 0 else "green"}">
+    <div class="kpi-lbl">📐 ROP Health</div>
+    <div class="kpi-val">{_rop_issues}</div>
+    <div class="kpi-sub">SKU{"s" if _rop_issues != 1 else ""} with ROP below lead-time demand</div>
   </div>
   <div class="kpi-card blue">
     <div class="kpi-lbl">⚡ Auto-Approved</div>
@@ -645,13 +950,39 @@ with left_col:
                     below    = on_hand < reorder
                     eff      = on_hand + on_order
                     pct      = min(on_hand / max(reorder, 1), 1.0) * 100
-                    bar_clr  = "#e53e3e" if below else "#38a169"
+                    bar_clr  = "#e53e3e" if below else "#00ED64"
                     card_cls = "crit" if below else ""
                     sbadge   = (
                         '<span class="badge b-crit">CRITICAL</span>' if pct < 25
                         else '<span class="badge b-high">LOW</span>' if below
                         else '<span class="badge b-ok">OK</span>'
                     )
+
+                    # ROP health indicator
+                    _avg_d = _avg_daily_map.get(item["sku"], 0)
+                    _lead  = _lead_time_map.get(item["sku"], 0)
+                    if _avg_d > 0 and _lead > 0:
+                        _days_at_rop = round(reorder / _avg_d, 1)
+                        _gap         = round(_lead - _days_at_rop, 1)
+                        if _days_at_rop >= _lead:
+                            _rop_icon, _rop_clr = "✅", "#00684A"
+                            _rop_txt = f"ROP fires at {_days_at_rop}d · lead {_lead}d — covered"
+                        elif _days_at_rop >= _lead * 0.7:
+                            _rop_icon, _rop_clr = "⚠️", "#b7791f"
+                            _rop_txt = f"ROP fires at {_days_at_rop}d · lead {_lead}d — safety stock bridges {_gap}d"
+                        else:
+                            _rop_icon, _rop_clr = "🔴", "#c53030"
+                            _rop_txt = f"ROP fires at {_days_at_rop}d · lead {_lead}d — undercalibrated by {_gap}d"
+                        _rop_html = (
+                            f'<div style="font-size:0.6rem;margin-top:5px;'
+                            f'padding:2px 6px;border-radius:4px;'
+                            f'background:{"#f0fff4" if _days_at_rop >= _lead else "#fffbeb" if _days_at_rop >= _lead * 0.7 else "#fff5f5"};'
+                            f'color:{_rop_clr};border:1px solid {_rop_clr}22">'
+                            f'{_rop_icon} {_rop_txt}</div>'
+                        )
+                    else:
+                        _rop_html = ""
+
                     st.markdown(f"""
 <div class="inv-card {card_cls}">
   <div style="display:flex;justify-content:space-between;align-items:center">
@@ -660,13 +991,14 @@ with left_col:
   <div class="inv-name">{item['name']}</div>
   <div class="inv-loc">{item['location']} · {item['category']}</div>
   <div class="bar-bg"><div class="bar-fill" style="width:{pct:.0f}%;background:{bar_clr}"></div></div>
-  <div style="font-size:0.62rem;color:#718096;margin-bottom:4px">{pct:.0f}% of reorder level</div>
+  <div style="font-size:0.62rem;color:#5C6C75;margin-bottom:4px">{pct:.0f}% of reorder level</div>
   <div class="inv-nums">
     <div class="inv-n"><div class="inv-nv">{on_hand:,}</div><div class="inv-nl">On Hand</div></div>
-    <div class="inv-n"><div class="inv-nv" style="color:#3182ce">{on_order:,}</div><div class="inv-nl">On Order</div></div>
+    <div class="inv-n"><div class="inv-nv" style="color:#00684A">{on_order:,}</div><div class="inv-nl">On Order</div></div>
     <div class="inv-n"><div class="inv-nv">{reorder:,}</div><div class="inv-nl">Reorder Pt</div></div>
-    <div class="inv-n"><div class="inv-nv" style="color:#805ad5">{eff:,}</div><div class="inv-nl">Effective</div></div>
+    <div class="inv-n"><div class="inv-nv" style="color:#023430">{eff:,}</div><div class="inv-nl">Effective</div></div>
   </div>
+  {_rop_html}
 </div>""", unsafe_allow_html=True)
 
 # ── Right panel: Alerts + Decisions ───────────────────────────────────────
@@ -718,6 +1050,7 @@ with right_col:
             auto_approved = order.get("auto_approved", False)
             used_search   = order.get("atlas_search_used", False)
 
+            review_reason = order.get("review_reason")
             conf_b   = {"high": '<span class="badge b-ok">HIGH</span>',
                         "medium": '<span class="badge b-med">MEDIUM</span>',
                         "low":    '<span class="badge b-crit">LOW</span>'}.get(confidence, "")
@@ -725,8 +1058,12 @@ with right_col:
                         "approved":          '<span class="badge b-ok">APPROVED</span>',
                         "rejected":          '<span class="badge b-crit">REJECTED</span>',
                         "received":          '<span class="badge b-teal">📦 RECEIVED</span>'}.get(status, "")
-            auto_b   = '<span class="badge b-purple">⚡ AUTO</span>'   if auto_approved else ""
-            srch_b   = '<span class="badge b-info">🔍 SEARCH</span>'  if used_search   else ""
+            auto_b    = '<span class="badge b-purple">⚡ AUTO</span>'   if auto_approved else ""
+            srch_b    = '<span class="badge b-info">🔍 SEARCH</span>'  if used_search   else ""
+            review_b  = (
+                f'<span class="badge b-amber" title="{review_reason}">⚠ REVIEW: {review_reason}</span>'
+                if review_reason and status == "awaiting_approval" else ""
+            )
             card_cls = ("teal" if status == "received"
                         else "ok" if status == "approved"
                         else "crit" if status == "rejected"
@@ -734,7 +1071,7 @@ with right_col:
 
             timing_line = _delivery_timing(order)
             timing_html = (
-                f'<div style="font-size:0.7rem;color:#718096;margin:3px 0 2px">{timing_line}</div>'
+                f'<div style="font-size:0.7rem;color:#5C6C75;margin:3px 0 2px">{timing_line}</div>'
                 if timing_line else ""
             )
             with st.container():
@@ -745,7 +1082,7 @@ with right_col:
     <span class="feed-loc"> @ {order['location']}</span></div>
     <span class="feed-age">{_ago(order.get('created_at'))}</span>
   </div>
-  <div style="margin:4px 0">{conf_b}{status_b}{auto_b}{srch_b}</div>
+  <div style="margin:4px 0">{conf_b}{status_b}{auto_b}{srch_b}{review_b}</div>
   {timing_html}<div class="feed-nums">
     <div><div class="feed-nv">{order['quantity_recommended']:,}</div><div class="feed-nl">Qty</div></div>
     <div><div class="feed-nv">${order['total_cost']:,.0f}</div><div class="feed-nl">Cost</div></div>
@@ -775,74 +1112,41 @@ with right_col:
                     _can_approve = _check_role("approver")
                     if not _can_approve:
                         st.caption("🔒 Viewer access — approval requires Approver or Admin role.")
-                    if _can_approve and btn1.button("✅ Approve", key=f"approve_{oid}", use_container_width=True):
-                        db.proposed_orders.update_one({"_id": oid}, {"$set": {"status": "approved"}})
-                        db.inventory.update_one(
-                            {"sku": order["sku"], "location": order["location"]},
-                            {"$inc": {"on_order": order["quantity_recommended"]}},
-                        )
-                        db.confidence_outcomes.update_one(
-                            {"order_id": oid},
-                            {"$set": {"human_decision": "approved", "outcome": "resolved"}},
-                        )
-                        db.order_history.update_one(
-                            {"proposed_order_id": oid},
-                            {"$set": {"outcome": "human_approved"}},
-                        )
-                        threading.Thread(
-                            target=write_human_decision_memory,
-                            args=(dict(order), "approved"),
-                            daemon=True,
-                        ).start()
-                        threading.Thread(
-                            target=append_lifecycle_event,
-                            args=(
-                                str(order.get("alert_id", "")),
-                                "human_approved",
-                                {"order_id": str(oid)},
-                                order.get("sku", ""),
-                                order.get("location", ""),
-                            ),
-                            daemon=True,
-                        ).start()
-                        st.rerun()
-                    if _can_approve and btn2.button("❌ Reject", key=f"reject_{oid}", use_container_width=True):
-                        db.proposed_orders.update_one({"_id": oid}, {"$set": {"status": "rejected"}})
-                        db.confidence_outcomes.update_one(
-                            {"order_id": oid},
-                            {"$set": {"human_decision": "rejected", "outcome": "escalated"}},
-                        )
-                        db.order_history.update_one(
-                            {"proposed_order_id": oid},
-                            {"$set": {"outcome": "rejected"}},
-                        )
-                        alert_id = order.get("alert_id")
-                        if alert_id:
-                            db.reorder_alerts.update_one(
-                                {"_id": alert_id},
-                                {
-                                    "$set":   {"status": "pending"},
-                                    "$unset": {"order_id": ""},
-                                    "$inc":   {"rejection_count": 1},
-                                },
-                            )
-                        threading.Thread(
-                            target=write_human_decision_memory,
-                            args=(dict(order), "rejected"),
-                            daemon=True,
-                        ).start()
-                        threading.Thread(
-                            target=append_lifecycle_event,
-                            args=(
-                                str(order.get("alert_id", "")),
-                                "human_rejected",
-                                {"order_id": str(oid)},
-                                order.get("sku", ""),
-                                order.get("location", ""),
-                            ),
-                            daemon=True,
-                        ).start()
-                        st.rerun()
+                    if _can_approve:
+                        # Detect which button (if any) is currently in flight for this order
+                        _inflight = st.session_state.get("_pending_human_decision", {})
+                        _inflight_oid = _inflight.get("oid_str") == str(oid)
+                        _inflight_action = _inflight.get("action") if _inflight_oid else None
+
+                        _approve_primary = _inflight_action == "approve"
+                        _reject_primary  = _inflight_action == "reject"
+
+                        if btn1.button(
+                            "✅ Approve",
+                            key=f"approve_{oid}",
+                            use_container_width=True,
+                            type="primary" if _approve_primary else "secondary",
+                            disabled=_reject_primary,
+                        ):
+                            st.session_state["_pending_human_decision"] = {
+                                "action":       "approve",
+                                "oid_str":      str(oid),
+                                "alert_id_str": str(order.get("alert_id", "")),
+                            }
+                            st.rerun()
+                        if btn2.button(
+                            "❌ Reject",
+                            key=f"reject_{oid}",
+                            use_container_width=True,
+                            type="primary" if _reject_primary else "secondary",
+                            disabled=_approve_primary,
+                        ):
+                            st.session_state["_pending_human_decision"] = {
+                                "action":       "reject",
+                                "oid_str":      str(oid),
+                                "alert_id_str": str(order.get("alert_id", "")),
+                            }
+                            st.rerun()
 
 
     # Confidence Calibration
@@ -932,11 +1236,7 @@ with right_col:
                             st.markdown(f"- {e}")
 
 # ---------------------------------------------------------------------------
-# Auto-refresh — triggers a Streamlit rerun every REFRESH_INTERVAL seconds
-# without a full browser page reload. st_autorefresh uses a tiny custom
-# component with an internal JS counter; each tick increments the counter,
-# Streamlit detects the widget value change and reruns the script cleanly.
-# This preserves session state and avoids the blank-flash / stale-content
-# artefacts caused by window.location.reload() or time.sleep + st.rerun.
+# Auto-refresh — triggers a Streamlit rerun every REFRESH_INTERVAL seconds.
+# st_autorefresh runs at the top level so it fires regardless of active tab.
 # ---------------------------------------------------------------------------
 st_autorefresh(interval=REFRESH_INTERVAL * 1000, key="dashboard_refresh")

@@ -1,7 +1,7 @@
 """
 Procedural Memory Engine — derives structured preference rules from repeated patterns.
 
-Scans short_term_memory for high-frequency supplier approval patterns and writes
+Scans proposed_orders for high-frequency supplier approval patterns and writes
 candidate rules to the `procedures` collection with human_confirmed=False.
 Rules must be confirmed by a human via the Streamlit admin panel before the agent
 uses them.
@@ -23,7 +23,7 @@ load_dotenv()
 
 _client = MongoClient(
     os.environ["MONGODB_URI"],
-    serverSelectionTimeoutMS=5_000,
+    serverSelectionTimeoutMS=30_000,
     connectTimeoutMS=10_000,
     socketTimeoutMS=30_000,
 )
@@ -36,23 +36,20 @@ _LOOKBACK_DAYS  = 30
 
 
 def extract_procedures() -> list[dict]:
-    """Scan short_term_memory and agent_memory for high-frequency approval patterns.
+    """Scan proposed_orders for high-frequency approval patterns.
 
     Returns a list of newly inserted candidate procedure dicts.
     """
     since = datetime.now(timezone.utc) - timedelta(days=_LOOKBACK_DAYS)
 
-    # Pull all approved decisions (agent auto-approved OR human approved) in the window.
-    approved_decisions = list(_db.short_term_memory.find(
+    # Pull all approved/received orders in the window from the permanent collection.
+    # short_term_memory has a 24h TTL so a 30-day lookback there is always empty.
+    approved_decisions = list(_db.proposed_orders.find(
         {
-            "decided_at": {"$gte": since},
-            "$or": [
-                {"auto_approved": True},
-                {"decided_by": "human", "human_decision": "approved"},
-            ],
+            "created_at": {"$gte": since},
+            "status":     {"$in": ["approved", "received"]},
         },
-        {"_id": 0, "sku": 1, "location": 1, "supplier_id": 1,
-         "supplier_name": 1, "confidence": 1},
+        {"_id": 0, "sku": 1, "location": 1, "supplier_id": 1, "supplier_name": 1},
     ))
 
     if not approved_decisions:

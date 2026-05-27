@@ -175,7 +175,7 @@ SUPPLIERS = [
     {
         "sku": "MED-2041", "supplier_name": "PharmaCo Ltd", "supplier_id": "SUP-001",
         "lead_time_days": 5, "moq": 500, "unit_price": 0.42,
-        "fill_rate_pct": 97.2, "on_time_delivery_pct": 94.1,
+        "fill_rate_pct": 97.2, "on_time_delivery_pct": 94.1, "fda_registered": True,
         "notes": (
             "Specializes in beta-lactam antibiotics and broad-spectrum oral pharmaceuticals. "
             "FDA-registered with GDP compliance. Offers expedited 48-hour rush delivery for "
@@ -186,7 +186,7 @@ SUPPLIERS = [
     {
         "sku": "MED-2041", "supplier_name": "MediSource Inc", "supplier_id": "SUP-002",
         "lead_time_days": 7, "moq": 250, "unit_price": 0.44,
-        "fill_rate_pct": 92.0, "on_time_delivery_pct": 89.5,
+        "fill_rate_pct": 92.0, "on_time_delivery_pct": 89.5, "fda_registered": True,
         "notes": (
             "General pharmaceutical distributor with broad antibiotic and oral medication catalog. "
             "Competitive pricing on lower minimum order quantities. Suitable for routine "
@@ -197,7 +197,7 @@ SUPPLIERS = [
     {
         "sku": "MED-3017", "supplier_name": "BioPharm Global", "supplier_id": "SUP-003",
         "lead_time_days": 10, "moq": 200, "unit_price": 11.80,
-        "fill_rate_pct": 98.5, "on_time_delivery_pct": 96.0,
+        "fill_rate_pct": 98.5, "on_time_delivery_pct": 96.0, "fda_registered": True,
         "notes": (
             "Biologics and insulin specialist with strict cold-chain and 2-8°C temperature "
             "controlled logistics. Handles temperature-sensitive pharmaceutical injectables. "
@@ -206,9 +206,11 @@ SUPPLIERS = [
         ),
     },
     {
+        # NOT FDA-registered — smaller secondary supplier, no wholesale drug distributor licence.
+        # The regulatory filter blocks this supplier for pharmaceutical SKUs.
         "sku": "MED-3017", "supplier_name": "Insulin Direct", "supplier_id": "SUP-004",
         "lead_time_days": 14, "moq": 100, "unit_price": 12.00,
-        "fill_rate_pct": 88.0, "on_time_delivery_pct": 85.0,
+        "fill_rate_pct": 88.0, "on_time_delivery_pct": 85.0, "fda_registered": False,
         "notes": (
             "Dedicated insulin and diabetes medication supplier. Lower fill rates and longer "
             "lead times make this supplier suitable for supplemental orders when the primary "
@@ -219,7 +221,7 @@ SUPPLIERS = [
     {
         "sku": "SURG-0084", "supplier_name": "SafeGlove Co", "supplier_id": "SUP-005",
         "lead_time_days": 3, "moq": 50, "unit_price": 8.50,
-        "fill_rate_pct": 99.0, "on_time_delivery_pct": 97.5,
+        "fill_rate_pct": 99.0, "on_time_delivery_pct": 97.5, "fda_registered": True,
         "notes": (
             "PPE and surgical glove manufacturer with domestic warehouse for rapid fulfillment. "
             "Specializes in nitrile, latex-free, and sterile surgical gloves for hospital and "
@@ -230,7 +232,7 @@ SUPPLIERS = [
     {
         "sku": "SURG-0084", "supplier_name": "MedSupply Direct", "supplier_id": "SUP-006",
         "lead_time_days": 5, "moq": 100, "unit_price": 8.20,
-        "fill_rate_pct": 94.0, "on_time_delivery_pct": 91.0,
+        "fill_rate_pct": 94.0, "on_time_delivery_pct": 91.0, "fda_registered": True,
         "notes": (
             "Medical consumables distributor covering gloves, masks, gowns, and general PPE. "
             "Bulk pricing available for high-volume orders. Standard warehouse-to-dock delivery. "
@@ -241,7 +243,7 @@ SUPPLIERS = [
     {
         "sku": "SURG-1122", "supplier_name": "IV Solutions LLC", "supplier_id": "SUP-007",
         "lead_time_days": 4, "moq": 200, "unit_price": 1.95,
-        "fill_rate_pct": 96.5, "on_time_delivery_pct": 93.0,
+        "fill_rate_pct": 96.5, "on_time_delivery_pct": 93.0, "fda_registered": True,
         "notes": (
             "IV fluid and parenteral solution specialist maintaining emergency reserve inventory "
             "for hospital networks. Can fulfill urgent critical orders within 24 hours for "
@@ -252,7 +254,7 @@ SUPPLIERS = [
     {
         "sku": "SURG-1122", "supplier_name": "ClearFlow Med", "supplier_id": "SUP-008",
         "lead_time_days": 6, "moq": 500, "unit_price": 1.90,
-        "fill_rate_pct": 91.0, "on_time_delivery_pct": 88.0,
+        "fill_rate_pct": 91.0, "on_time_delivery_pct": 88.0, "fda_registered": True,
         "notes": (
             "High-volume IV bags and infusion equipment supplier. Best price-per-unit at large "
             "order quantities. Suitable for planned procurement and standing orders. Full batch "
@@ -263,7 +265,7 @@ SUPPLIERS = [
     {
         "sku": "MED-4490", "supplier_name": "GeneriPharma", "supplier_id": "SUP-009",
         "lead_time_days": 7, "moq": 1000, "unit_price": 0.17,
-        "fill_rate_pct": 95.0, "on_time_delivery_pct": 92.0,
+        "fill_rate_pct": 95.0, "on_time_delivery_pct": 92.0, "fda_registered": True,
         "notes": (
             "Generic oral medication manufacturer with high-volume metformin and diabetes drug "
             "production lines. Cost-effective for large standing orders. FDA ANDA approved "
@@ -271,9 +273,11 @@ SUPPLIERS = [
         ),
     },
     {
+        # NOT FDA-registered — bulk wholesale broker without licensed distributor status.
+        # The regulatory filter blocks this supplier for pharmaceutical SKUs.
         "sku": "MED-4490", "supplier_name": "BulkRx Wholesale", "supplier_id": "SUP-010",
         "lead_time_days": 10, "moq": 2000, "unit_price": 0.15,
-        "fill_rate_pct": 89.0, "on_time_delivery_pct": 86.0,
+        "fill_rate_pct": 89.0, "on_time_delivery_pct": 86.0, "fda_registered": False,
         "notes": (
             "Wholesale pharmaceutical distributor offering lowest unit pricing at very high MOQ. "
             "Long lead times require integration into quarterly procurement planning cycles. "
@@ -284,7 +288,7 @@ SUPPLIERS = [
     {
         "sku": "MED-5502", "supplier_name": "NovaBiotics Inc", "supplier_id": "SUP-011",
         "lead_time_days": 3, "moq": 50, "unit_price": 8.25,
-        "fill_rate_pct": 98.0, "on_time_delivery_pct": 95.5,
+        "fill_rate_pct": 98.0, "on_time_delivery_pct": 95.5, "fda_registered": True,
         "notes": (
             "Specialty IV antibiotic manufacturer with 24-hour emergency fulfillment for vancomycin "
             "and glycopeptide antibiotics. FDA-registered and GDP-compliant with lot traceability. "
@@ -295,7 +299,7 @@ SUPPLIERS = [
     {
         "sku": "MED-5502", "supplier_name": "AntibioCare Pharma", "supplier_id": "SUP-012",
         "lead_time_days": 6, "moq": 25, "unit_price": 8.75,
-        "fill_rate_pct": 91.0, "on_time_delivery_pct": 88.0,
+        "fill_rate_pct": 91.0, "on_time_delivery_pct": 88.0, "fda_registered": True,
         "notes": (
             "Hospital pharmacy supplier specializing in IV-formulated antibiotics and antifungals. "
             "Low MOQ suitable for smaller top-up orders between primary supplier deliveries. "
@@ -307,7 +311,7 @@ SUPPLIERS = [
     {
         "sku": "MED-6201", "supplier_name": "CoagPharma Ltd", "supplier_id": "SUP-013",
         "lead_time_days": 4, "moq": 200, "unit_price": 3.10,
-        "fill_rate_pct": 97.0, "on_time_delivery_pct": 94.0,
+        "fill_rate_pct": 97.0, "on_time_delivery_pct": 94.0, "fda_registered": True,
         "notes": (
             "Anticoagulant and parenteral medication specialist with robust heparin supply chain. "
             "Maintains inventory buffer for surgical program support and peri-operative care. "
@@ -316,9 +320,11 @@ SUPPLIERS = [
         ),
     },
     {
+        # NOT FDA-registered — secondary broker without licensed wholesale distributor status.
+        # The regulatory filter blocks this supplier for pharmaceutical SKUs.
         "sku": "MED-6201", "supplier_name": "AnticoagDirect", "supplier_id": "SUP-014",
         "lead_time_days": 7, "moq": 100, "unit_price": 3.25,
-        "fill_rate_pct": 90.0, "on_time_delivery_pct": 87.0,
+        "fill_rate_pct": 90.0, "on_time_delivery_pct": 87.0, "fda_registered": False,
         "notes": (
             "Secondary heparin and anticoagulant distributor. Longer lead time offset by low MOQ "
             "and competitive pricing on smaller orders. Suitable as backup when primary supplier "
@@ -329,7 +335,7 @@ SUPPLIERS = [
     {
         "sku": "DIAG-0331", "supplier_name": "QuickDiag Labs", "supplier_id": "SUP-015",
         "lead_time_days": 2, "moq": 200, "unit_price": 4.50,
-        "fill_rate_pct": 96.0, "on_time_delivery_pct": 93.0,
+        "fill_rate_pct": 96.0, "on_time_delivery_pct": 93.0, "fda_registered": True,
         "notes": (
             "Rapid diagnostic test kit manufacturer with domestic warehouse for fast-turnaround "
             "fulfillment. Specializes in combo respiratory panel kits covering influenza A/B and "
@@ -340,7 +346,7 @@ SUPPLIERS = [
     {
         "sku": "DIAG-0331", "supplier_name": "TestBridge Inc", "supplier_id": "SUP-016",
         "lead_time_days": 5, "moq": 500, "unit_price": 4.60,
-        "fill_rate_pct": 88.0, "on_time_delivery_pct": 85.0,
+        "fill_rate_pct": 88.0, "on_time_delivery_pct": 85.0, "fda_registered": True,
         "notes": (
             "Bulk diagnostic test kit distributor with strong pricing at high volumes. Suited for "
             "seasonal and pandemic preparedness procurement planning. Longer lead time requires "
@@ -352,7 +358,7 @@ SUPPLIERS = [
     {
         "sku": "SURG-2244", "supplier_name": "RespiraTech PPE", "supplier_id": "SUP-017",
         "lead_time_days": 3, "moq": 200, "unit_price": 2.75,
-        "fill_rate_pct": 98.5, "on_time_delivery_pct": 96.0,
+        "fill_rate_pct": 98.5, "on_time_delivery_pct": 96.0, "fda_registered": True,
         "notes": (
             "NIOSH-approved N95 respirator manufacturer with domestic production for rapid "
             "fulfillment. Specializes in healthcare-grade respiratory protection for surgical "
@@ -363,7 +369,7 @@ SUPPLIERS = [
     {
         "sku": "SURG-2244", "supplier_name": "N95Shield Supply", "supplier_id": "SUP-018",
         "lead_time_days": 5, "moq": 500, "unit_price": 2.65,
-        "fill_rate_pct": 92.0, "on_time_delivery_pct": 89.0,
+        "fill_rate_pct": 92.0, "on_time_delivery_pct": 89.0, "fda_registered": True,
         "notes": (
             "High-volume N95 and surgical mask distributor. Best unit pricing at large order "
             "quantities for planned replenishment and strategic stockpile procurement. Full NIOSH "
@@ -375,7 +381,7 @@ SUPPLIERS = [
     {
         "sku": "LAB-0112", "supplier_name": "LabCore Supplies", "supplier_id": "SUP-019",
         "lead_time_days": 3, "moq": 100, "unit_price": 6.00,
-        "fill_rate_pct": 97.5, "on_time_delivery_pct": 95.0,
+        "fill_rate_pct": 97.5, "on_time_delivery_pct": 95.0, "fda_registered": True,
         "notes": (
             "Clinical laboratory supply specialist with rapid order fulfillment for blood culture "
             "media and microbiology consumables. Covers aerobic, anaerobic and fungal culture "
@@ -386,7 +392,7 @@ SUPPLIERS = [
     {
         "sku": "LAB-0112", "supplier_name": "ClinPath Direct", "supplier_id": "SUP-020",
         "lead_time_days": 6, "moq": 200, "unit_price": 5.80,
-        "fill_rate_pct": 90.0, "on_time_delivery_pct": 87.5,
+        "fill_rate_pct": 90.0, "on_time_delivery_pct": 87.5, "fda_registered": True,
         "notes": (
             "Clinical pathology consumables distributor. Competitive pricing on bulk blood culture "
             "and microbiology supply orders. Suitable for routine planned replenishment cycles. "
@@ -984,7 +990,8 @@ def seed_order_history() -> None:
 
 
 def seed_clear_alerts_and_orders() -> None:
-    print("Clearing reorder_alerts, proposed_orders, agent memory, and checkpoints …")
+    print("Clearing reorder_alerts, proposed_orders, short-term memory, and checkpoints …")
+    print("  (long-term agent_memory is preserved across resets)")
     db.reorder_alerts.drop()
     db.reorder_alerts.create_index([("status", ASCENDING)])
     db.reorder_alerts.create_index([("sku", ASCENDING), ("created_at", ASCENDING)])
@@ -997,9 +1004,7 @@ def seed_clear_alerts_and_orders() -> None:
     db.proposed_orders.create_index([("sku", ASCENDING), ("location", ASCENDING), ("status", ASCENDING)])
     # created_at: UI sort find({}).sort("created_at", -1) fires every 5 s
     db.proposed_orders.create_index([("created_at", ASCENDING)])
-    # Clear agent memory so each demo run starts fresh
     db.short_term_memory.drop()
-    db.agent_memory.drop()
     # Clear LangGraph checkpoints — these grow unboundedly during a demo session
     # (one checkpoint per graph node per alert). Dropping on reseed keeps the
     # collection from bloating across multiple demo runs.

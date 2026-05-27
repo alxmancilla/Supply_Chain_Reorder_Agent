@@ -30,7 +30,7 @@ flowchart TD
         N1 -->|"coverage_gap == 0\nzero-gap fast path"| N6
         N1 -->|"coverage_gap > 0"| N2
 
-        N2["2 · retrieval_agent\nReAct tool-calling loop\nLLM decides which tools to call\nmax 20 iterations"]
+        N2["2 · retrieval_agent\nReAct tool-calling loop\nLLM decides which tools to call\nmax 20 iterations · $rankFusion supplier search"]
 
         N2 --> N3
 
@@ -157,7 +157,7 @@ classDiagram
         get_inventory_position
         get_supplier_options
         get_consumption_trend
-        search_suppliers_by_capability [Atlas Search]
+        search_suppliers_by_capability [rankFusion]
         find_similar_past_orders [Vector Search]
         get_recent_decisions [short-term memory]
         get_learned_patterns [Vector Search]
@@ -223,6 +223,7 @@ classDiagram
         quantity > 0
         confidence in high · medium · low
         supplier_id non-empty
+        FDA-registered supplier for pharma/lab SKUs
         ─────────────────────────────────────
         OUTPUT state fields
         audit_result.valid: bool
@@ -245,7 +246,8 @@ classDiagram
         inventory · consumption · similar_orders
         ─────────────────────────────────────
         AUTO-APPROVE condition
-        confidence == high AND cost < $2500
+        confidence == high AND cost < $5000
+        review_reason: budget_threshold or confidence!=high
         ─────────────────────────────────────
         WRITES to MongoDB
         proposed_orders: full order document

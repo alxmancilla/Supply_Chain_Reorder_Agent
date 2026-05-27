@@ -82,10 +82,23 @@ load_dotenv()
 log = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
+# Business-rule thresholds
+# ---------------------------------------------------------------------------
+# Orders at or above this cost always route to human review regardless of
+# confidence level.  A procurement specialist, not the agent, approves high-
+# value orders.  Adjust to match your organisation's authority policy.
+_AUTO_APPROVE_MAX_USD = 5_000.00
+
+# Categories that require an FDA-registered wholesale distributor.
+# Selecting a non-FDA supplier for these categories is a hard compliance
+# violation caught by the audit agent.
+_FDA_REQUIRED_CATEGORIES = frozenset({"pharmaceutical", "laboratory"})
+
+# ---------------------------------------------------------------------------
 # Clients
 # ---------------------------------------------------------------------------
 _MONGO_KWARGS = dict(
-    serverSelectionTimeoutMS=5_000,
+    serverSelectionTimeoutMS=30_000,
     connectTimeoutMS=10_000,
     socketTimeoutMS=30_000,
 )
@@ -633,11 +646,20 @@ async def save_and_notify(state: AgentState) -> AgentState:
     if coverage_gap is not None and coverage_gap == 0:
         quantity = 0
 
-    AUTO_APPROVE_MAX_COST = 2_500.00
     total_cost    = round(quantity * unit_price, 2)
     zero_order    = quantity == 0 and total_cost == 0.0
-    auto_approved = zero_order or (confidence == "high" and total_cost < AUTO_APPROVE_MAX_COST)
+    over_budget   = total_cost >= _AUTO_APPROVE_MAX_USD
+    auto_approved = zero_order or (confidence == "high" and not over_budget)
     status        = "approved" if auto_approved else "awaiting_approval"
+
+    if zero_order:
+        review_reason = None
+    elif over_budget:
+        review_reason = f"budget_threshold (${total_cost:,.0f} ≥ ${_AUTO_APPROVE_MAX_USD:,.0f} limit)"
+    elif confidence != "high":
+        review_reason = f"confidence={confidence}"
+    else:
+        review_reason = None
 
     clean_similar = [
         {k: v for k, v in o.items() if k != "embedding"}
@@ -663,6 +685,7 @@ async def save_and_notify(state: AgentState) -> AgentState:
         "retrieval_trace":        state.get("retrieval_trace", []),
         "status":                 status,
         "auto_approved":          auto_approved,
+        "review_reason":          review_reason,
         "created_at":             datetime.now(timezone.utc),
         "alert_id":               ObjectId(alert["_id"]),
     }
@@ -683,7 +706,7 @@ async def save_and_notify(state: AgentState) -> AgentState:
     })
 
     # Record agent decision in lifecycle log
-    loop_lc = asyncio.get_event_loop()
+    loop_lc = asyncio.get_running_loop()
     loop_lc.run_in_executor(
         None, append_lifecycle_event,
         alert["_id"], "agent_decision",
@@ -718,7 +741,7 @@ async def save_and_notify(state: AgentState) -> AgentState:
     trend          = state.get("consumption", {}).get("trend", "stable")
     item_name      = state.get("inventory", {}).get("name", "")
     category       = state.get("inventory", {}).get("category", "unknown")
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     await asyncio.gather(
         loop.run_in_executor(
             None, write_short_term_memory_sync,
@@ -776,7 +799,7 @@ async def _notify_escalation_webhook(url: str, sku: str, alert: dict, reason: st
         )
         urllib.request.urlopen(req, timeout=5)
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     try:
         await loop.run_in_executor(None, _post)
         print(f"  [escalate] Webhook notified for {sku}")

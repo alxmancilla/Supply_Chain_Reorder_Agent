@@ -20,6 +20,9 @@ Writes reorder_alerts        agents, saves proposed_orders,              decisio
 to MongoDB every 5 s         reads/writes dual-layer memory              Approve/Reject buttons
 ```
 
+For a Mermaid data-flow diagram see [DASHBOARD_ARCHITECTURE.md](DASHBOARD_ARCHITECTURE.md).
+For node-by-node agent diagrams see [WORKFLOW.md](WORKFLOW.md).
+
 ---
 
 ## Multi-Agent Graph Topology
@@ -46,8 +49,8 @@ END
 | `retrieval_agent` | **ReAct agent** — LLM decides which tools to call and in what order; populates `retrieval_results` and `retrieval_trace` in state |
 | `analysis_agent` | Evaluates suppliers; outputs `analysis` dict with `best_supplier_id`, `confidence`, `risk_flags`, and a `reasoning_trace`; **no quantity calculation** |
 | `recommendation_agent` | Receives analysis output; calculates quantity and writes rationale; outputs full `recommendation` dict |
-| `audit_agent` | Validates recommendation schema and policy rules; retries `recommendation_agent` up to 2× on failure; routes to `escalate` on max retries |
-| `save_and_notify` | Writes `proposed_orders`; **auto-approves** if confidence is `high` and cost `< $2,500`; writes short-term and long-term memory; records `confidence_outcomes` entry |
+| `audit_agent` | Validates recommendation schema, policy rules, and FDA regulatory constraints (pharmaceutical and laboratory SKUs must use an FDA-registered supplier); retries `recommendation_agent` up to 2× on failure; routes to `escalate` on max retries |
+| `save_and_notify` | Writes `proposed_orders`; **auto-approves** if confidence is `high` and cost `< $5,000`; orders routed to human review include a `review_reason` field (`"budget_threshold ($X ≥ $5,000 limit)"` or low-confidence); writes short-term and long-term memory; records `confidence_outcomes` entry |
 | `escalate` | Writes to `escalation_queue`; sets alert status to `"escalated"`; optionally POSTs a webhook notification |
 
 Every graph invocation is checkpointed to MongoDB via **LangGraph `MongoDBSaver`** (`checkpoints` collection).
@@ -59,7 +62,7 @@ Every graph invocation is checkpointed to MongoDB via **LangGraph `MongoDBSaver`
 | `get_inventory_position` | Basic `find` | Live on-hand, on-order, reorder-point |
 | `get_supplier_options` | `find`, sort by fill rate | Approved suppliers for the SKU |
 | `get_consumption_trend` | **Time Series** aggregation | 14-day avg daily demand + trend direction |
-| `search_suppliers_by_capability` | **Atlas Search** (`$search`) | Rank suppliers by text relevance to product + urgency |
+| `search_suppliers_by_capability` | **Atlas Search** (`$rankFusion`) | RRF hybrid search combining a `name_match` pipeline (0.4 weight) and a `capability_match` pipeline (0.6 weight); falls back to compound `$search` on M0 tier |
 | `find_similar_past_orders` | **Atlas Vector Search** (`$vectorSearch`) on `order_history` | Semantically similar historical orders as precedent (score ≥ 0.78) |
 | `get_episode_history` | `find` on `alert_lifecycle` | Full event timeline for the 3 most recent past alerts for this SKU+location |
 
@@ -119,9 +122,11 @@ Orders are automatically set to `status: approved` when **both** conditions are 
 | Condition | Value |
 |---|---|
 | Agent confidence | `high` |
-| Total order cost | `< $2,500.00` |
+| Total order cost | `< $5,000.00` |
 
 Zero-quantity orders (zero-gap fast path) are always auto-approved regardless of cost.
+
+Orders that do not meet both conditions are routed to human review with a `review_reason` field on the order document. The value is `"budget_threshold ($X ≥ $5,000 limit)"` for cost-driven routing, or `"low_confidence"` / `"medium_confidence"` for confidence-driven routing. The dashboard surfaces this as a `⚠ REVIEW: <reason>` badge on awaiting-approval order cards.
 
 ### Confidence level criteria
 
@@ -334,7 +339,7 @@ Within ~30 seconds you should see inventory levels ticking down, reorder alerts 
 
 ## Dashboard (`app.py`)
 
-The dashboard auto-refreshes every **10 seconds**.
+The dashboard auto-refreshes every **5 seconds**.
 
 ### Column 1 — Live Inventory
 
@@ -349,15 +354,22 @@ The dashboard auto-refreshes every **10 seconds**.
 ### Column 3 — Agent Decisions
 
 - Awaiting-approval orders sort to the top.
-- Confidence progress bar. `⚡ Auto-approved` and `🔍 Atlas Search` badges.
+- Confidence progress bar. `⚡ Auto-approved` badge for auto-approved orders; `⚠ REVIEW: <reason>` badge on orders held for human review (budget-threshold or low-confidence routing).
 - Expandable Agent Rationale and Similar Past Orders sections.
 - Approve / Reject buttons (requires `approver` or `admin` role when auth is enabled).
+
+Each inventory card also shows a per-SKU ROP health indicator:
+- ✅ green: ROP fires at X days, lead time Y days — covered
+- ⚠️ amber: safety stock bridges the gap
+- 🔴 red: undercalibrated by X days
+
+A **📐 ROP Health** KPI card (7th card in the KPI row) counts the total number of SKUs where the reorder point fires before the preferred supplier can deliver.
 
 ### Escalated Alerts section
 
 Appears when any alert has been escalated. Shows SKU, location, rejection count, and escalation timestamp.
 
-### Confidence Calibration tab
+### Confidence Calibration expander
 
 Aggregation table showing how well predicted confidence (`high`/`medium`/`low`) correlates with actual outcomes (`resolved`/`pending`/`escalated`). Populated as the agent processes alerts and humans make decisions.
 
@@ -365,7 +377,7 @@ Aggregation table showing how well predicted confidence (`high`/`medium`/`low`) 
 
 **Simulator Controls** — Start / pause / stop + drain speed slider (1× to 10×).
 
-**Supplier Search** — Full-text Atlas Search across supplier capability notes with 3× name boost and fuzzy matching.
+**Supplier Search** — `$rankFusion` hybrid search combining two independent `$search` sub-pipelines: `name_match` (weight 0.4) for exact supplier-name hits and `capability_match` (weight 0.6) for fuzzy capability-notes matching, merged via Reciprocal Rank Fusion. Falls back to compound `$search` on M0 tier. Source label shows **🔀 $rankFusion**.
 
 **Demo Status** — Live counters: decisions, auto-approved %, escalations, failed memory writes, long-term memories.
 
@@ -378,6 +390,8 @@ Aggregation table showing how well predicted confidence (`high`/`medium`/`low`) 
 | Circuit Breaker status / Reset | Shows failure count; reset button clears the counter and resumes LLM calls |
 | Extract Rules | Runs `procedure_extractor.py` — scans `short_term_memory` for patterns (same supplier approved ≥5× in 30 days for same category+location) and writes candidate rules to `procedures` |
 | Compact Memory | Runs `memory_compactor.py` — deduplicates near-identical `agent_memory` entries (cosine similarity > 0.95) and summarises old entries |
+| Procedure candidate review | Expander listing `procedures` docs where `human_confirmed: False`; per-rule ✅ Confirm and 🗑 Dismiss buttons; confirmed rules are passed to the agent via `get_applicable_procedures` tool |
+| 🔁 Agent Recovery Log | Expander that reads the `checkpoints` collection (LangGraph `MongoDBSaver`), groups by `thread_id` (= alert `_id`), and shows each pipeline run: SKU, location, last node executed, step count, and run outcome (completed ✅ / re-queued 🔄 / escalated 🔺 / recovered mid-pipeline ⚡) |
 
 ### Reject flow
 
@@ -485,6 +499,10 @@ Supply_Chain_Reorder_Agent/
 ├── docker-compose.kafka.yml         # kafka mode overlay
 ├── .env.example
 ├── requirements.txt
+├── README.md
+├── DASHBOARD_ARCHITECTURE.md        # Mermaid data-flow diagram (simulator → Atlas → agent → dashboard)
+├── WORKFLOW.md                      # node-by-node agent diagrams (system flow + agent cards + state schema)
+├── DEMO_SCRIPT.md                   # 5-minute demo walkthrough with talking points
 ├── auth/
 │   └── users.yaml.example           # copy to users.yaml and fill credentials
 ├── data/
@@ -557,9 +575,26 @@ Supply_Chain_Reorder_Agent/
 | **TTL Index** | `short_term_memory.decided_at` (24 h); `sku_processing_locks.expires_at` (5 min crash-recovery) |
 | **Unique Index** | `sku_processing_locks.{sku, location}` — enforces distributed lock exclusivity atomically |
 | **Compound Indexes** | `(sku, location, status)` on `proposed_orders`; `(status, created_at)` on `reorder_alerts`; `(sku, location, decided_at)` on `short_term_memory` |
-| **Atlas Search** | Supplier capability search with compound operator, 3× name boost, fuzzy matching; powers sidebar Supplier Search |
+| **Atlas Search** | Supplier capability search via `$rankFusion` (two named `$search` sub-pipelines merged via Reciprocal Rank Fusion); falls back to compound `$search` on M0 tier; powers sidebar Supplier Search |
+| **`$rankFusion` / Reciprocal Rank Fusion** | Two independent named `$search` pipelines (`name_match` at 0.4 weight, `capability_match` at 0.6 weight) merged via RRF so a supplier ranking highly in either path rises to the top regardless of raw score scale |
 | **Atlas Vector Search** | Category-filtered search on `order_history`; location-filterable search on `agent_memory` |
+| **FDA regulatory hard filter** | `audit_agent` calls `validate_recommendation()` in `agent/tools.py`; pharmaceutical and laboratory SKUs are rejected and retried if the recommended supplier does not have `fda_registered: True`; constraint is also stated in `ANALYSIS_SYSTEM_PROMPT` |
+| **ROP health check** | `app.py` aggregates 30-day average consumption from `consumption_history` and best lead time from `suppliers` in two batch queries; each inventory card shows a ✅ / ⚠️ / 🔴 ROP health indicator; a **📐 ROP Health** KPI card counts at-risk SKUs |
 | **LangGraph MongoDBSaver** | Checkpoints full graph state to `checkpoints` per alert invocation |
 | **Atomic `findOneAndUpdate`** | Alert claim (pending → processing) prevents two workers racing on the same document |
 
 > **Note on Atlas Stream Processing:** In production, `stream_simulator.py` would be replaced by an Atlas Stream Processing pipeline consuming from Apache Kafka. The agent code is identical regardless — it only sees the `reorder_alerts` collection.
+
+---
+
+## Supply Chain Domain Features
+
+1. **`$rankFusion` hybrid search** — supplier search uses two independent `$search` pipelines (name-match and capability-notes) merged via Reciprocal Rank Fusion, giving more robust ranking than a single compound query. Falls back to compound `$search` on M0 tier.
+
+2. **Budget authority thresholds** — the auto-approve ceiling is `$5,000` (module constant `_AUTO_APPROVE_MAX_USD = 5_000.00` in `agent/graph.py`). Orders at or above this threshold are routed to human review with a `review_reason` field surfaced as a `⚠ REVIEW` badge in the dashboard.
+
+3. **FDA regulatory enforcement** — `validate_recommendation()` in `agent/tools.py` rejects any recommendation that assigns a non-FDA-registered supplier to a pharmaceutical or laboratory SKU. The `audit_agent` retries the recommendation pipeline on violation. Three suppliers (SUP-004, SUP-010, SUP-014) have `fda_registered: False` in the seeded data.
+
+4. **ROP health monitoring** — each inventory card shows a per-SKU reorder-point health indicator (✅ covered / ⚠️ safety-stock bridge / 🔴 undercalibrated). A KPI card counts at-risk SKUs across the full inventory. Computed via two O(1) batch aggregations per dashboard refresh.
+
+5. **Agent Recovery Log** — the Admin Panel exposes a 🔁 Agent Recovery Log that reads LangGraph `MongoDBSaver` checkpoints, groups them by alert, and shows each pipeline run's outcome (completed ✅ / re-queued 🔄 / escalated 🔺 / recovered mid-pipeline ⚡), making crash-recovery tangible in the UI.

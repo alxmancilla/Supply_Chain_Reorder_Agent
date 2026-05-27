@@ -27,7 +27,7 @@ log = get_logger(__name__)
 
 client = MongoClient(
     os.environ["MONGODB_URI"],
-    serverSelectionTimeoutMS=5_000,
+    serverSelectionTimeoutMS=30_000,
     connectTimeoutMS=10_000,
     socketTimeoutMS=30_000,
 )
@@ -147,9 +147,18 @@ def check_and_alert(sku_doc: dict, consumption: int) -> None:
             "avg_daily_consumption": avg_daily,
             "days_of_stock_remaining": days_remaining,
             "status": "pending",
+            "rejection_count": 0,
             "created_at": datetime.now(timezone.utc),
         }
         alerts_collection.insert_one(alert)
+        append_lifecycle_event(
+            str(alert["_id"]),
+            "alert_created",
+            {"on_hand": on_hand, "days_remaining": days_remaining,
+             "avg_daily": avg_daily, "reorder_point": reorder_point},
+            sku,
+            sku_doc["location"],
+        )
         log.warning("reorder alert created", extra={
             "sku": sku, "location": sku_doc["location"],
             "on_hand": on_hand, "days_remaining": days_remaining,
@@ -159,46 +168,50 @@ def check_and_alert(sku_doc: dict, consumption: int) -> None:
             "sku": sku, "location": sku_doc["location"],
             "consumed": consumption, "on_hand": on_hand, "reorder_point": reorder_point,
         })
-        # Detect stock recovery: if effective_stock is now above reorder_point
-        # after previously being below it, write a stock_recovered lifecycle event
-        # for the most recent processed alert for this SKU+location.
-        if effective_stock >= reorder_point:
-            recent_alert = alerts_collection.find_one(
-                {"sku": sku, "location": sku_doc["location"], "status": "processed"},
-                sort=[("created_at", -1)],
+        # Fire stock_recovered once per alert episode: find the most recent
+        # processed alert that hasn't been marked recovered yet, then flip its
+        # status so subsequent OK ticks don't re-fire the event.
+        recent_alert = alerts_collection.find_one_and_update(
+            {
+                "sku": sku,
+                "location": sku_doc["location"],
+                "status": "processed",
+            },
+            {"$set": {"status": "recovered"}},
+            sort=[("created_at", -1)],
+        )
+        if recent_alert:
+            avg_daily = get_avg_daily_consumption(sku)
+            append_lifecycle_event(
+                str(recent_alert["_id"]),
+                "stock_recovered",
+                {"on_hand": on_hand, "avg_daily": avg_daily},
+                sku,
+                sku_doc["location"],
             )
-            if recent_alert:
-                avg_daily = get_avg_daily_consumption(sku)
-                append_lifecycle_event(
-                    str(recent_alert["_id"]),
-                    "stock_recovered",
-                    {"on_hand": on_hand, "avg_daily": avg_daily},
-                    sku,
-                    sku_doc["location"],
+            # Update confidence_outcomes with recovery data
+            created_at = recent_alert.get("created_at")
+            if created_at:
+                now_utc = datetime.now(timezone.utc)
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=timezone.utc)
+                days_to_recovery = round(
+                    (now_utc - created_at).total_seconds() / 86400, 1
                 )
-                # Update confidence_outcomes with recovery data
-                created_at = recent_alert.get("created_at")
-                if created_at:
-                    now_utc = datetime.now(timezone.utc)
-                    if created_at.tzinfo is None:
-                        created_at = created_at.replace(tzinfo=timezone.utc)
-                    days_to_recovery = round(
-                        (now_utc - created_at).total_seconds() / 86400, 1
+                db.confidence_outcomes.update_one(
+                    {"alert_id": recent_alert["_id"], "outcome": {"$ne": "resolved"}},
+                    {"$set": {
+                        "days_to_stock_recovery": days_to_recovery,
+                        "outcome":                "resolved",
+                    }},
+                )
+                # Graduate the live order into a completed precedent
+                order_id = recent_alert.get("order_id")
+                if order_id:
+                    db.order_history.update_one(
+                        {"proposed_order_id": order_id},
+                        {"$set": {"outcome": "delivered_on_time"}},
                     )
-                    db.confidence_outcomes.update_one(
-                        {"alert_id": recent_alert["_id"], "outcome": {"$ne": "resolved"}},
-                        {"$set": {
-                            "days_to_stock_recovery": days_to_recovery,
-                            "outcome":                "resolved",
-                        }},
-                    )
-                    # Graduate the live order into a completed precedent
-                    order_id = recent_alert.get("order_id")
-                    if order_id:
-                        db.order_history.update_one(
-                            {"proposed_order_id": order_id},
-                            {"$set": {"outcome": "delivered_on_time"}},
-                        )
 
 
 # ---------------------------------------------------------------------------

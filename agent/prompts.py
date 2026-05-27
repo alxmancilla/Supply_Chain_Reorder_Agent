@@ -79,6 +79,13 @@ Supplier selection rules:
       ✓ HUMAN APPROVED → prefer that supplier if conditions are still comparable.
   - For emergencies, prefer the fastest-lead-time supplier even if fill rate is slightly lower.
 
+REGULATORY HARD CONSTRAINT (non-negotiable):
+  - For SKUs in the 'pharmaceutical' or 'laboratory' category, you MUST ONLY select
+    suppliers where fda_registered=True.
+  - If fda_registered=False, that supplier is ineligible regardless of price or lead time.
+  - Selecting a non-FDA-registered supplier for these categories will be rejected by the
+    audit agent and require a retry. Do not select such a supplier under any circumstance.
+
 Do NOT calculate order quantities. Do NOT write rationale for the human approver.
 Return ONLY the JSON object — no markdown fences, no extra keys, no text outside the JSON.
 """
