@@ -364,13 +364,24 @@ def _wait_for_inventory(timeout: int = 180) -> None:
 
 def run() -> None:
     log.info("stream simulator started")
-    _set_state("running")
+
+    # Preserve any paused/stopped state the user set via the dashboard before
+    # this container restarted.  Only initialise to "running" when no control
+    # document exists yet (first-ever start).
+    if not control_collection.find_one({"_id": _CONTROL_ID}):
+        _set_state("running")
 
     _wait_for_inventory()
 
     while True:
         try:
             state = _get_state()
+
+            # Delivery of approved orders continues even when paused/stopped so
+            # that in-flight orders are not frozen mid-transit.  Elapsed time is
+            # wall-clock based (created_at), so orders would all deliver at once
+            # the moment the simulator is unpaused if we skip this call.
+            deliver_pending_orders()
 
             if state in ("paused", "stopped"):
                 time.sleep(2)
@@ -386,7 +397,6 @@ def run() -> None:
             sku_doc     = random.choice(all_skus)
             consumption = random.randint(15, 60) * speed
             check_and_alert(sku_doc, consumption)
-            deliver_pending_orders()
 
         except KeyboardInterrupt:
             log.info("simulator stopped by interrupt")
