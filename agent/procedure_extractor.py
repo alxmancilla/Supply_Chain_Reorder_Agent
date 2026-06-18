@@ -17,17 +17,10 @@ from datetime import datetime, timedelta, timezone
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dotenv import load_dotenv
-from pymongo import MongoClient
+
+from agent.db import db_sync as _db
 
 load_dotenv()
-
-_client = MongoClient(
-    os.environ["MONGODB_URI"],
-    serverSelectionTimeoutMS=30_000,
-    connectTimeoutMS=10_000,
-    socketTimeoutMS=30_000,
-)
-_db = _client["supply_chain_demo"]
 
 # A rule candidate is promoted when the same supplier is approved (by agent or human)
 # at least this many times for the same category+location within the look-back window.

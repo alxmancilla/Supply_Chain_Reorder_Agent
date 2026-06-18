@@ -17,21 +17,13 @@ from bson import ObjectId
 import voyageai
 from dotenv import load_dotenv
 from langchain_core.tools import tool
-from pymongo import MongoClient
 
+from agent.db import db_sync as _db
 from agent.logger import get_logger
 
 load_dotenv()
 
 log = get_logger(__name__)
-
-_client = MongoClient(
-    os.environ["MONGODB_URI"],
-    serverSelectionTimeoutMS=30_000,
-    connectTimeoutMS=10_000,
-    socketTimeoutMS=30_000,
-)
-_db = _client["supply_chain_demo"]
 
 # Grove API gateway (Azure-style api-key auth)
 _GROVE_API_KEY  = os.environ["GROVE_API_KEY"]

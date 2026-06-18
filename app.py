@@ -9,7 +9,6 @@ Layout:
 """
 
 import os
-import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -20,7 +19,10 @@ from dotenv import load_dotenv
 from streamlit_autorefresh import st_autorefresh
 from pymongo import MongoClient
 
-from agent.tools import append_lifecycle_event, write_human_decision_memory
+# append_lifecycle_event / write_human_decision_memory are now called from
+# inside the graph (save_and_notify) after interrupt() resumes — not from here.
+from agent.graph import build_graph
+from langgraph.types import Command
 
 load_dotenv()
 
@@ -86,6 +88,57 @@ def get_db():
 
 db = get_db()
 
+
+# ---------------------------------------------------------------------------
+# Agent graph — shared instance used to resume interrupted (human-review) runs.
+# ---------------------------------------------------------------------------
+# When save_and_notify calls interrupt(), LangGraph saves the full graph state
+# to the `checkpoints` collection via MongoDBSaver.  Calling graph.invoke() with
+# Command(resume=...) here reloads that state and continues the node from the
+# point right after interrupt() returned.
+#
+# Both the agent process (graph.py) and the dashboard (this file) use the same
+# MongoDBSaver → same checkpoint store → seamless hand-off between processes.
+# ---------------------------------------------------------------------------
+@st.cache_resource
+def get_agent_graph():
+    """Return a compiled LangGraph instance for resuming interrupted human-review flows."""
+    try:
+        return build_graph()
+    except Exception as exc:
+        # Non-fatal: the dashboard still works without graph resume capability.
+        import warnings
+        warnings.warn(f"Could not build agent graph for human-review resume: {exc}")
+        return None
+
+
+_agent_graph = get_agent_graph()
+
+
+def _resume_graph(thread_id: str, decision: dict) -> None:
+    """Resume a paused graph with a human decision.
+
+    Args:
+        thread_id: str(_id) of the reorder_alert — same thread_id used when
+                   the graph was first invoked in agent/graph.py.
+        decision:  dict passed to interrupt()'s return value, e.g.
+                   {"approved": True, "approver": "jsmith"}
+                   {"approved": False, "reason": "wrong supplier"}
+    """
+    if _agent_graph is None:
+        return   # fallback: graph unavailable, dashboard will do direct writes
+    try:
+        _agent_graph.invoke(
+            Command(resume=decision),
+            config={"configurable": {"thread_id": thread_id}},
+        )
+    except Exception as exc:
+        # Log but don't crash the dashboard — the approve/reject write in session
+        # state already updated proposed_orders; memories are the only missing piece.
+        import warnings
+        warnings.warn(f"Graph resume failed (memories may be missing): {exc}")
+
+
 # ---------------------------------------------------------------------------
 # Persist human decisions across reruns (autorefresh race-condition fix)
 # ---------------------------------------------------------------------------
@@ -108,78 +161,36 @@ if _pending_procedure:
 
 _pending_decision = st.session_state.pop("_pending_human_decision", None)
 if _pending_decision:
-    _pd_oid        = ObjectId(_pending_decision["oid_str"])
-    _pd_action     = _pending_decision["action"]
-    _pd_alert_str  = _pending_decision.get("alert_id_str", "")
-    _pd_alert_id   = ObjectId(_pd_alert_str) if _pd_alert_str else None
-    _pd_order      = db.proposed_orders.find_one({"_id": _pd_oid})
+    _pd_oid       = ObjectId(_pending_decision["oid_str"])
+    _pd_action    = _pending_decision["action"]
+    _pd_alert_str = _pending_decision.get("alert_id_str", "")
+    _pd_order     = db.proposed_orders.find_one({"_id": _pd_oid})
+
     if _pd_order and _pd_order.get("status") == "awaiting_approval":
+        # Resume the paused LangGraph graph with the human's decision.
+        #
+        # _agent_graph.invoke(Command(resume={...})) reloads the checkpoint that
+        # was written when save_and_notify called interrupt(), re-enters that node
+        # right after the interrupt() call, and runs the approve/reject logic that
+        # lives inside the graph — updating the order status, inventory, memories,
+        # and lifecycle events in one place.
+        #
+        # thread_id = str(alert._id) — the same value used in _process_one_alert.
         if _pd_action == "approve":
-            db.proposed_orders.update_one({"_id": _pd_oid}, {"$set": {"status": "approved"}})
-            db.inventory.update_one(
-                {"sku": _pd_order["sku"], "location": _pd_order["location"]},
-                {"$inc": {"on_order": _pd_order["quantity_recommended"]}},
+            _resume_graph(
+                thread_id=_pd_alert_str,
+                decision={"approved": True, "approver": st.session_state.get("username", "human")},
             )
-            db.confidence_outcomes.update_one(
-                {"order_id": _pd_oid},
-                {"$set": {"human_decision": "approved", "outcome": "resolved"}},
-            )
-            db.order_history.update_one(
-                {"proposed_order_id": _pd_oid},
-                {"$set": {"outcome": "human_approved"}},
-            )
-            threading.Thread(
-                target=write_human_decision_memory,
-                args=(dict(_pd_order), "approved"),
-                daemon=True,
-            ).start()
-            threading.Thread(
-                target=append_lifecycle_event,
-                args=(
-                    str(_pd_order.get("alert_id", "")), "human_approved",
-                    {"order_id": str(_pd_oid)},
-                    _pd_order.get("sku", ""), _pd_order.get("location", ""),
-                ),
-                daemon=True,
-            ).start()
             st.toast(
                 f"✅ Approved — {_pd_order.get('quantity_recommended', 0):,} units"
                 f" from {_pd_order.get('supplier_name', 'supplier')}"
                 f" ({_pd_order.get('sku', '')} @ {_pd_order.get('location', '')})"
             )
         elif _pd_action == "reject":
-            db.proposed_orders.update_one({"_id": _pd_oid}, {"$set": {"status": "rejected"}})
-            db.confidence_outcomes.update_one(
-                {"order_id": _pd_oid},
-                {"$set": {"human_decision": "rejected", "outcome": "escalated"}},
+            _resume_graph(
+                thread_id=_pd_alert_str,
+                decision={"approved": False, "reason": "human_rejected"},
             )
-            db.order_history.update_one(
-                {"proposed_order_id": _pd_oid},
-                {"$set": {"outcome": "rejected"}},
-            )
-            if _pd_alert_id:
-                db.reorder_alerts.update_one(
-                    {"_id": _pd_alert_id},
-                    {
-                        "$set":   {"status": "pending"},
-                        "$unset": {"order_id": ""},
-                        "$inc":   {"rejection_count": 1},
-                    },
-                )
-            threading.Thread(
-                target=write_human_decision_memory,
-                args=(dict(_pd_order), "rejected"),
-                daemon=True,
-            ).start()
-            threading.Thread(
-                target=append_lifecycle_event,
-                args=(
-                    str(_pd_order.get("alert_id", "")), "human_rejected",
-                    {"order_id": str(_pd_oid)},
-                    _pd_order.get("sku", ""), _pd_order.get("location", ""),
-                ),
-                daemon=True,
-            ).start()
             st.toast(
                 f"❌ Rejected — {_pd_order.get('sku', '')} @ {_pd_order.get('location', '')}"
                 " reset for reprocessing."

@@ -1,23 +1,32 @@
 """
-LangGraph agent — multi-agent reorder pipeline.
+LangGraph agent — supply chain reorder pipeline.
 
-Graph topology:
+Graph topology (5 nodes):
     START
-      → assess_alert          (DB-only: inventory position + coverage gap)
-      → route_by_urgency      (conditional: zero-gap fast path vs retrieval)
-          ↘ save_and_notify   (zero-gap fast path — no LLM needed)
-          ↘ retrieval_agent   (ReAct tool-calling loop: gathers context)
-              → analysis_agent        (evaluates suppliers, assigns confidence)
-                  → recommendation_agent  (calculates quantity, writes rationale)
-                      → audit_agent       (validates schema + business rules)
-                          ↘ recommendation_agent  (retry, max 2 times)
-                          ↘ save_and_notify        (valid recommendation)
+      → assess_alert     (DB-only: inventory position + coverage gap)
+      → route_by_urgency (conditional: zero-gap fast path vs recommend)
+          ↘ save_order   (zero-gap fast path — no LLM needed)
+          ↘ recommend    (retrieval + analysis + recommendation + validation)
+              → save_order  (write order; interrupt() for human review)
+                  → write_memories  (short-term, long-term, history)
+      → escalate         (validation failed — writes escalation record)
       → END
 
-ReAct retrieval tools:
-  1. get_inventory_position        (basic find)
-  2. get_supplier_options          (basic find, fill-rate sorted)
-  3. get_consumption_trend         (time series aggregation)
+Node responsibilities:
+  assess_alert   — read MongoDB, compute coverage gap
+  recommend      — ReAct tool loop → LLM analysis → LLM recommendation → validate
+  save_order     — write proposed_order; interrupt() for human review
+  write_memories — persist decision to all three memory layers
+  escalate       — write escalation record if recommend cannot produce a valid order
+
+Explain mode (EXPLAIN_MODE=1):
+  Each node prints a plain-English description of what it is doing.
+  Useful for learning and live demos without reading JSON logs.
+
+ReAct retrieval tools (called inside recommend):
+  1. get_inventory_position           (basic find)
+  2. get_supplier_options             (basic find, fill-rate sorted)
+  3. get_consumption_trend            (time series aggregation)
   4. search_suppliers_by_capability   ← Atlas Search
   5. find_similar_past_orders         ← Atlas Vector Search on order_history
   6. get_recent_decisions             ← per-SKU rolling 24 h window
@@ -42,13 +51,13 @@ from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
-from langgraph.prebuilt import create_react_agent
-from motor.motor_asyncio import AsyncIOMotorClient
-from pymongo import MongoClient
+from langgraph.prebuilt import create_react_agent  # noqa: F401 — still works; langchain.agents.create_react_agent has a different signature
+from langgraph.types import interrupt, Command  # noqa: F401 — Command re-exported for app.py
 
 from langgraph.checkpoint.mongodb import MongoDBSaver
 
 from agent import sku_lock
+from agent.db import sync_client as _sync_client, db_sync as _db_sync, db_async as _db_async
 from agent.logger import get_logger
 from agent.schemas import validate_alert, write_dead_letter
 from agent.prompts import (
@@ -95,17 +104,26 @@ _AUTO_APPROVE_MAX_USD = 5_000.00
 _FDA_REQUIRED_CATEGORIES = frozenset({"pharmaceutical", "laboratory"})
 
 # ---------------------------------------------------------------------------
-# Clients
+# Explain mode — set EXPLAIN_MODE=1 to see plain-English node descriptions
 # ---------------------------------------------------------------------------
-_MONGO_KWARGS = dict(
-    serverSelectionTimeoutMS=30_000,
-    connectTimeoutMS=10_000,
-    socketTimeoutMS=30_000,
-)
-_sync_client  = MongoClient(os.environ["MONGODB_URI"], **_MONGO_KWARGS)
-_async_client = AsyncIOMotorClient(os.environ["MONGODB_URI"], **_MONGO_KWARGS)
-_db_sync      = _sync_client["supply_chain_demo"]
-_db_async     = _async_client["supply_chain_demo"]
+# Each agent node calls _explain() at the start and (optionally) end of its
+# work.  This is a teaching aid: beginners can run with EXPLAIN_MODE=1 and
+# see exactly what the graph is doing without reading the JSON structured logs.
+#
+# Usage:
+#   EXPLAIN_MODE=1 python agent/graph.py
+# ---------------------------------------------------------------------------
+_EXPLAIN = os.getenv("EXPLAIN_MODE", "").lower() in {"1", "true", "yes"}
+
+
+def _explain(msg: str) -> None:
+    """Print a plain-English description of what the agent is doing right now.
+
+    Enabled when EXPLAIN_MODE=1 is set in the environment.  Messages are
+    flushed immediately so they appear in real time alongside the JSON logs.
+    """
+    if _EXPLAIN:
+        print(f"\n  💡 [EXPLAIN] {msg}", flush=True)
 
 # ---------------------------------------------------------------------------
 # LLM — Grove API gateway with fallback + circuit breaker
@@ -282,7 +300,7 @@ class AgentState(TypedDict):
     coverage_gap:            int    # Units still needed to reach the reorder point
     expedite:                bool   # True when days_of_stock_remaining < 2
 
-    # ── Retrieval fields (populated by retrieval_agent_node) ─────────────
+    # ── Retrieval fields (populated by recommend node) ───────────────────
     suppliers:               list   # get_supplier_options result
     consumption:             dict   # get_consumption_trend result
     supplier_search_results: list   # Atlas Search result
@@ -292,18 +310,15 @@ class AgentState(TypedDict):
     retrieval_results:       dict   # Raw tool results keyed by tool name
     retrieval_trace:         list   # Ordered list of {tool, args} dicts
 
-    # ── Analysis fields (populated by analysis_agent_node) ────────────────
+    # ── Recommend fields (populated by recommend node) ────────────────────
     analysis:                dict   # {best_supplier_id, confidence, risk_flags, reasoning_trace}
-
-    # ── Recommendation fields (populated by recommendation_agent_node) ────
     recommendation:          dict   # {supplier_id, supplier_name, quantity, rationale, confidence}
+    escalate_flag:           bool   # True when recommend exhausts retries — routes to escalate
 
-    # ── Audit fields (populated by audit_agent_node) ──────────────────────
-    audit_result:            dict   # {valid: bool, errors: list[str]}
-    audit_retries:           int    # Number of failed audit attempts so far
-
-    # ── Persistence fields (populated by save_and_notify) ─────────────────
-    order_id:                str    # _id of the saved proposed_order
+    # ── Persistence fields (populated by save_order / write_memories) ────────
+    order_id:             str    # _id of the saved proposed_order
+    human_approved:       bool   # True when the order was ultimately approved
+    final_recommendation: dict   # The rec dict actually used (LLM-generated or synthetic zero-order)
 
 
 # ---------------------------------------------------------------------------
@@ -319,6 +334,13 @@ async def assess_alert(state: AgentState) -> AgentState:
     agent from recommending a full reorder when a partial order already exists.
     """
     alert = state["alert"]
+
+    _explain(
+        f"[assess_alert] Checking inventory for {alert['sku']} @ {alert['location']}. "
+        "I'll look at on-hand stock and any existing orders to compute how many units "
+        "we still need to reach the reorder point (the 'coverage gap')."
+    )
+
     inv   = get_inventory_position.invoke({"sku": alert["sku"], "location": alert["location"]})
 
     active_orders = list(_db_sync.proposed_orders.find(
@@ -338,6 +360,13 @@ async def assess_alert(state: AgentState) -> AgentState:
     days               = alert.get("days_of_stock_remaining", 99)
     expedite           = days < 2
 
+    _explain(
+        f"[assess_alert] Result: on-hand={on_hand}, on-order={existing_order_qty}, "
+        f"reorder point={reorder_point} → coverage gap={coverage_gap} units. "
+        + ("⚡ EXPEDITE — less than 2 days of stock remaining!" if expedite else "Stock is not critical.")
+        + (" Zero gap: skipping LLM, jumping straight to save_order." if coverage_gap == 0 else "")
+    )
+
     log.info("coverage gap computed", extra={
         "phase":              "assess_alert",
         "sku":                alert["sku"],
@@ -348,8 +377,9 @@ async def assess_alert(state: AgentState) -> AgentState:
         "coverage_gap":       coverage_gap,
         "expedite":           expedite,
     })
+    # Return only the keys this node computed — LangGraph merges partial
+    # dicts with the existing state via per-channel reducers.
     return {
-        **state,
         "inventory":          inv,
         "existing_order_qty": existing_order_qty,
         "coverage_gap":       coverage_gap,
@@ -358,16 +388,31 @@ async def assess_alert(state: AgentState) -> AgentState:
 
 
 # ---------------------------------------------------------------------------
-# Node 2: retrieval_agent — ReAct tool-calling loop
+# Node 2: recommend — retrieval → analysis → recommendation → validation
+# ---------------------------------------------------------------------------
+#
+# All four former nodes (retrieval_agent, analysis_agent, recommendation_agent,
+# audit_agent) are merged here so beginners see a single, readable step:
+#   Step 1 — ReAct tool-calling loop (gather suppliers, trends, memory)
+#   Step 2 — LLM analysis            (rank suppliers, assign confidence)
+#   Step 3 — LLM recommendation      (calculate quantity, write rationale)
+#   Step 4 — Inline validation        (Pydantic rules + FDA compliance; retries internally)
 # ---------------------------------------------------------------------------
 
-async def retrieval_agent_node(state: AgentState) -> AgentState:
-    """Run the ReAct retrieval agent to gather procurement context via tool calls.
+async def recommend(state: AgentState) -> dict:
+    """Retrieval → Analysis → Recommendation → Validation in a single node.
 
-    The LLM decides which tools to call and in what order based on the alert
-    urgency and what data is needed. Results are extracted from the message
-    history and mapped back to the standard AgentState fields so downstream
-    nodes (analysis, recommendation, save) can read them as before.
+    Step 1 — ReAct tool-calling loop
+        The LLM decides which tools to call (Atlas Search, Vector Search,
+        time series, memory) until it has enough context.
+    Step 2 — LLM analysis
+        Rank suppliers by fill rate, lead time, FDA compliance, and cost.
+        Assign a confidence score: high / medium / low.
+    Step 3 — LLM recommendation
+        Calculate order quantity, select the best supplier, write rationale.
+    Step 4 — Inline validation
+        Pydantic schema check + FDA / budget rules.  Retries internally
+        (up to _MAX_JSON_RETRIES times) before escalating.
     """
     alert     = state["alert"]
     inventory = state.get("inventory", {})
@@ -376,6 +421,13 @@ async def retrieval_agent_node(state: AgentState) -> AgentState:
     expedite  = state.get("expedite", False)
 
     urgency_label = "CRITICAL" if days < 2 else "ELEVATED" if days < 5 else "STANDARD"
+
+    # ── Step 1: Retrieval (ReAct tool-calling loop) ──────────────────────────
+    _explain(
+        f"[recommend] Step 1/3 — ReAct retrieval for {alert['sku']} (urgency={urgency_label}). "
+        "The LLM picks tools: supplier search (Atlas Search), similar orders (Vector Search), "
+        "consumption trend, short-term and long-term memory."
+    )
 
     context = (
         f"Gather context for a procurement decision.\n\n"
@@ -393,22 +445,16 @@ async def retrieval_agent_node(state: AgentState) -> AgentState:
 
     try:
         result = await _retrieval_react_agent.ainvoke(
-            {
-                "messages": [
-                    HumanMessage(content=RETRIEVAL_SYSTEM_PROMPT + "\n\n" + context),
-                ]
-            },
+            {"messages": [HumanMessage(content=RETRIEVAL_SYSTEM_PROMPT + "\n\n" + context)]},
             config={"recursion_limit": 20},
         )
         retrieval_results, retrieval_trace = _extract_retrieval_results(result["messages"])
     except Exception as exc:
         log.warning("ReAct agent failed, falling back to direct calls", extra={
-            "phase": "retrieval_agent", "sku": alert.get("sku"), "error": str(exc),
+            "phase": "recommend", "sku": alert.get("sku"), "error": str(exc),
         })
         retrieval_results, retrieval_trace = {}, []
 
-    # Map tool results to the existing state fields for downstream compatibility.
-    # Fallback to direct calls if the agent missed a required tool.
     suppliers = retrieval_results.get("get_supplier_options", [])
     if not suppliers or (len(suppliers) == 1 and "error" in suppliers[0]):
         suppliers = get_supplier_options.invoke({"sku": alert["sku"]})
@@ -427,21 +473,20 @@ async def retrieval_agent_node(state: AgentState) -> AgentState:
     def _count(results: list) -> int:
         return len([r for r in results if "error" not in r and "info" not in r])
 
+    _explain(
+        f"[recommend] Retrieval done — {len(retrieval_trace)} tool call(s). "
+        f"{len(suppliers)} suppliers · {_count(similar_orders)} similar past orders "
+        f"· trend={consumption.get('trend', '?')}."
+    )
     log.info("retrieval complete", extra={
-        "phase":         "retrieval_agent",
-        "sku":           alert["sku"],
-        "location":      alert.get("location"),
-        "tool_calls":    len(retrieval_trace),
-        "suppliers":     len(suppliers),
-        "avg_daily":     consumption.get("avg_daily"),
-        "trend":         consumption.get("trend", "?"),
-        "atlas_hits":    _count(supplier_search),
-        "vector_hits":   _count(similar_orders),
-        "short_term":    _count(short_term_mems),
-        "long_term":     _count(long_term_mems),
+        "phase": "recommend", "sku": alert["sku"], "location": alert.get("location"),
+        "tool_calls": len(retrieval_trace), "suppliers": len(suppliers),
+        "avg_daily": consumption.get("avg_daily"), "trend": consumption.get("trend", "?"),
+        "atlas_hits": _count(supplier_search), "vector_hits": _count(similar_orders),
     })
 
-    return {
+    # Build a local context dict for prompt builders (not written to state yet)
+    ctx = {
         **state,
         "suppliers":               suppliers,
         "consumption":             consumption,
@@ -453,174 +498,154 @@ async def retrieval_agent_node(state: AgentState) -> AgentState:
         "retrieval_trace":         retrieval_trace,
     }
 
+    # ── Step 2: Analysis ─────────────────────────────────────────────────────
+    _explain(
+        f"[recommend] Step 2/3 — LLM evaluating {len(suppliers)} supplier(s): "
+        "fill rate · lead time · FDA compliance · cost → confidence score."
+    )
 
-# ---------------------------------------------------------------------------
-# Node 3: analysis_agent — supplier evaluation and confidence scoring
-# ---------------------------------------------------------------------------
-
-async def analysis_agent_node(state: AgentState) -> AgentState:
-    """Evaluate retrieved context and produce a structured risk assessment.
-
-    Outputs: best_supplier_id, confidence (high/medium/low), risk_flags, reasoning_trace.
-    Does NOT calculate quantities — that is the recommendation agent's responsibility.
-    """
-    prompt   = build_analysis_prompt(state)
-    messages = [
+    analysis_messages = [
         {"role": "system", "content": ANALYSIS_SYSTEM_PROMPT},
-        {"role": "user",   "content": prompt},
+        {"role": "user",   "content": build_analysis_prompt(ctx)},
     ]
-
     analysis = None
     for attempt in range(_MAX_JSON_RETRIES):
-        response = await _llm_invoke(messages)
+        response = await _llm_invoke(analysis_messages)
         try:
             analysis = _parse_llm_json(response.content)
             break
         except json.JSONDecodeError as exc:
             if attempt < _MAX_JSON_RETRIES - 1:
-                print(
-                    f"  [analysis_agent] JSON parse error (attempt {attempt + 1}/"
-                    f"{_MAX_JSON_RETRIES}): {exc} — asking model to self-correct …"
-                )
-                messages = messages + [
+                analysis_messages += [
                     {"role": "assistant", "content": response.content},
                     {"role": "user",      "content": f"{_JSON_STRIP_FIX}\nError: {exc}"},
                 ]
             else:
-                raise ValueError(
-                    f"Analysis agent returned invalid JSON after {_MAX_JSON_RETRIES} attempts: {exc}"
-                ) from exc
+                raise ValueError(f"Analysis returned invalid JSON after {_MAX_JSON_RETRIES} attempts: {exc}") from exc
 
-    log.info("analysis complete", extra={
-        "phase":      "analysis_agent",
-        "sku":        state["alert"]["sku"],
-        "location":   state["alert"].get("location"),
-        "supplier":   analysis.get("best_supplier_name"),
-        "confidence": analysis.get("confidence"),
-        "risk_flags": analysis.get("risk_flags", []),
-    })
-    return {**state, "analysis": analysis}
+    _explain(
+        f"[recommend] Best supplier: {analysis.get('best_supplier_name', '?')}, "
+        f"confidence={analysis.get('confidence', '?')}. "
+        f"Risk flags: {analysis.get('risk_flags', []) or 'none'}."
+    )
+    ctx = {**ctx, "analysis": analysis}
 
+    # ── Step 3: Recommendation + inline validation ───────────────────────────
+    _explain("[recommend] Step 3/3 — LLM calculating order quantity and writing rationale.")
 
-# ---------------------------------------------------------------------------
-# Node 4: recommendation_agent — quantity calculation and rationale
-# ---------------------------------------------------------------------------
+    recommendation: dict = {}
+    prior_errors: list[str] = []
+    escalate_flag = False
 
-async def recommendation_agent_node(state: AgentState) -> AgentState:
-    """Draft the final purchase order recommendation.
-
-    Receives the analyst's assessment (confidence, best supplier, risk flags)
-    and produces a quantity + plain-English rationale for the human approver.
-    Appends any previous audit validation errors to the prompt on retry.
-    """
-    prompt = build_recommendation_prompt(state)
-
-    # On retry: prepend previous validation errors so the agent fixes them.
-    prior_errors = state.get("audit_result", {}).get("errors", [])
-    if prior_errors:
-        error_block = (
-            "\n\nPREVIOUS VALIDATION ERRORS — fix all of these before resubmitting:\n"
-            + "\n".join(f"  - {e}" for e in prior_errors)
-        )
-        prompt = prompt + error_block
-
-    messages = [
-        {"role": "system", "content": RECOMMENDATION_SYSTEM_PROMPT},
-        {"role": "user",   "content": prompt},
-    ]
-
-    recommendation = None
     for attempt in range(_MAX_JSON_RETRIES):
-        response = await _llm_invoke(messages)
-        try:
-            recommendation = _parse_llm_json(response.content)
+        rec_prompt = build_recommendation_prompt({**ctx, "audit_result": {"errors": prior_errors}})
+        if prior_errors:
+            rec_prompt += (
+                "\n\nPREVIOUS VALIDATION ERRORS — fix all of these:\n"
+                + "\n".join(f"  - {e}" for e in prior_errors)
+            )
+        rec_messages = [
+            {"role": "system", "content": RECOMMENDATION_SYSTEM_PROMPT},
+            {"role": "user",   "content": rec_prompt},
+        ]
+        for json_attempt in range(_MAX_JSON_RETRIES):
+            response = await _llm_invoke(rec_messages)
+            try:
+                recommendation = _parse_llm_json(response.content)
+                break
+            except json.JSONDecodeError as exc:
+                if json_attempt < _MAX_JSON_RETRIES - 1:
+                    rec_messages += [
+                        {"role": "assistant", "content": response.content},
+                        {"role": "user",      "content": f"{_JSON_STRIP_FIX}\nError: {exc}"},
+                    ]
+                else:
+                    raise ValueError(f"Recommendation returned invalid JSON: {exc}") from exc
+
+        errors = validate_recommendation(recommendation, ctx)
+        if not errors:
+            _explain(f"[recommend] ✅ Validation passed — handing off to save_order.")
             break
-        except json.JSONDecodeError as exc:
-            if attempt < _MAX_JSON_RETRIES - 1:
-                print(
-                    f"  [recommendation_agent] JSON parse error (attempt {attempt + 1}/"
-                    f"{_MAX_JSON_RETRIES}): {exc} — asking model to self-correct …"
-                )
-                messages = messages + [
-                    {"role": "assistant", "content": response.content},
-                    {"role": "user",      "content": f"{_JSON_STRIP_FIX}\nError: {exc}"},
-                ]
-            else:
-                raise ValueError(
-                    f"Recommendation agent returned invalid JSON after {_MAX_JSON_RETRIES} attempts: {exc}"
-                ) from exc
+        prior_errors = errors
+        _explain(f"[recommend] ❌ Validation failed ({len(errors)} error(s)): {errors}. "
+                 + ("Escalating." if attempt + 1 >= _MAX_JSON_RETRIES else "Retrying …"))
+        log.warning("validation failed", extra={
+            "phase": "recommend", "sku": alert["sku"], "attempt": attempt + 1, "errors": errors,
+        })
+        if attempt + 1 >= _MAX_JSON_RETRIES:
+            escalate_flag = True
 
-    log.info("recommendation drafted", extra={
-        "phase":      "recommendation_agent",
-        "sku":        state["alert"]["sku"],
-        "location":   state["alert"].get("location"),
-        "quantity":   recommendation.get("quantity"),
-        "supplier":   recommendation.get("supplier_name"),
+    log.info("recommend complete", extra={
+        "phase": "recommend", "sku": alert["sku"], "location": alert.get("location"),
+        "supplier": recommendation.get("supplier_name"),
+        "quantity": recommendation.get("quantity"),
         "confidence": recommendation.get("confidence"),
+        "escalate": escalate_flag,
     })
-    return {**state, "recommendation": recommendation}
-
-
-# ---------------------------------------------------------------------------
-# Node 5: audit_agent — schema and business-rule validation
-# ---------------------------------------------------------------------------
-
-async def audit_agent_node(state: AgentState) -> AgentState:
-    """Validate the recommendation against schema and business rules.
-
-    If invalid, the recommendation_agent node will be retried (up to 2 times)
-    with the error list injected into its prompt.
-    """
-    rec    = state.get("recommendation", {})
-    errors = validate_recommendation(rec, state)
-    valid  = len(errors) == 0
-    retries = state.get("audit_retries", 0)
-
-    if valid:
-        log.info("recommendation valid", extra={
-            "phase":      "audit_agent",
-            "sku":        state["alert"]["sku"],
-            "location":   state["alert"].get("location"),
-            "quantity":   rec.get("quantity"),
-            "confidence": rec.get("confidence"),
-        })
-    else:
-        log.warning("recommendation invalid", extra={
-            "phase":    "audit_agent",
-            "sku":      state["alert"]["sku"],
-            "location": state["alert"].get("location"),
-            "retry":    retries + 1,
-            "errors":   errors,
-        })
 
     return {
-        **state,
-        "audit_result":  {"valid": valid, "errors": errors},
-        "audit_retries": retries + (0 if valid else 1),
+        "suppliers":               suppliers,
+        "consumption":             consumption,
+        "supplier_search_results": supplier_search,
+        "similar_orders":          similar_orders,
+        "short_term_memories":     short_term_mems,
+        "long_term_memories":      long_term_mems,
+        "retrieval_results":       retrieval_results,
+        "retrieval_trace":         retrieval_trace,
+        "analysis":                analysis,
+        "recommendation":          recommendation,
+        "escalate_flag":           escalate_flag,
     }
 
 
 # ---------------------------------------------------------------------------
-# Node 6: save_and_notify — write proposed_order, memories, update inventory
+# Node 3: save_order — write proposed_order, handle auto-approve / interrupt
+# Node 4: write_memories — persist decision to all three memory layers
 # ---------------------------------------------------------------------------
 
-async def save_and_notify(state: AgentState) -> AgentState:
-    """Write proposed_order, auto-approve if high confidence, write memories."""
+async def save_order(state: AgentState) -> dict:
+    """Node 6a — Write the proposed order, then auto-approve or pause for human review.
+
+    Responsibilities (single):
+      • Insert the proposed_order document into MongoDB.
+      • If confidence is high and cost < ceiling → auto-approve immediately.
+      • Otherwise → call interrupt() to pause the graph and wait for a human.
+
+    # ── How interrupt() works ────────────────────────────────────────────────
+    # interrupt() is a LangGraph primitive.  When called:
+    #   1. LangGraph serialises the full graph state and writes it to the
+    #      `checkpoints` collection via MongoDBSaver — the graph is now FROZEN.
+    #   2. graph.ainvoke() returns to the caller (the Change Stream handler).
+    #   3. The Streamlit dashboard detects `status: awaiting_approval` in MongoDB
+    #      and shows the review card to the procurement specialist.
+    #   4. On button click, the dashboard calls:
+    #        graph.invoke(Command(resume={"approved": True, "approver": "jsmith"}),
+    #                     config={"configurable": {"thread_id": alert_id}})
+    #   5. LangGraph reloads the checkpoint from MongoDB and re-enters THIS node
+    #      right after the interrupt() call — execution continues with the human
+    #      decision available as a plain Python dict.
+    #
+    # Open MongoDB Atlas → `checkpoints` collection while the graph is paused.
+    # You will see the full agent state frozen in a document — that is the
+    # entire LangGraph + MongoDBSaver story visible in one Atlas query.
+    # ────────────────────────────────────────────────────────────────────────
+
+    Returns (partial dict — LangGraph merges into state via reducers):
+        order_id             — MongoDB _id of the inserted proposed_order
+        human_approved       — True if auto-approved or human said yes
+        final_recommendation — the rec dict used (LLM-generated or synthetic)
+    """
     alert        = state["alert"]
     coverage_gap = state.get("coverage_gap")
 
+    # ── Build recommendation ─────────────────────────────────────────────────
     # Zero-gap fast path: route_by_urgency jumped here without running any LLM.
-    # Build a synthetic zero-order recommendation so the rest of the function
-    # works uniformly.
+    # We synthesise a zero-quantity rec so the rest of the node is uniform.
     rec = state.get("recommendation") or {}
     if not rec or coverage_gap == 0:
         existing = state.get("existing_order_qty", 0)
-        reorder  = state.get("inventory", {}).get(
-            "reorder_point", alert.get("reorder_point", 0)
-        )
-        on_hand  = state.get("inventory", {}).get(
-            "on_hand", alert.get("on_hand", 0)
-        )
+        reorder  = state.get("inventory", {}).get("reorder_point", alert.get("reorder_point", 0))
+        on_hand  = state.get("inventory", {}).get("on_hand", alert.get("on_hand", 0))
         rec = {
             "supplier_id":   None,
             "supplier_name": "N/A",
@@ -630,7 +655,7 @@ async def save_and_notify(state: AgentState) -> AgentState:
                 f"({on_hand} units) already meet or exceed the reorder point "
                 f"({reorder} units). No additional stock is required."
             ),
-            "confidence":    "high",
+            "confidence": "high",
         }
 
     chosen     = next(
@@ -642,7 +667,6 @@ async def save_and_notify(state: AgentState) -> AgentState:
     lead_time  = chosen.get("lead_time_days", 0)
     confidence = rec.get("confidence", "medium")
 
-    # Safety override: if existing orders already close the gap, force zero.
     if coverage_gap is not None and coverage_gap == 0:
         quantity = 0
 
@@ -650,7 +674,6 @@ async def save_and_notify(state: AgentState) -> AgentState:
     zero_order    = quantity == 0 and total_cost == 0.0
     over_budget   = total_cost >= _AUTO_APPROVE_MAX_USD
     auto_approved = zero_order or (confidence == "high" and not over_budget)
-    status        = "approved" if auto_approved else "awaiting_approval"
 
     if zero_order:
         review_reason = None
@@ -667,6 +690,14 @@ async def save_and_notify(state: AgentState) -> AgentState:
         if "error" not in o and "info" not in o
     ]
 
+    _explain(
+        f"Writing proposed order for {alert['sku']} @ {alert['location']} — "
+        f"{quantity:,} units from {rec.get('supplier_name', 'N/A')}, "
+        f"${total_cost:,.2f}, confidence={confidence}. "
+        + ("Auto-approved ✅" if auto_approved else f"Needs human review ⏸  ({review_reason})")
+    )
+
+    # ── Insert proposed_order ────────────────────────────────────────────────
     order = {
         "sku":                    alert["sku"],
         "location":               alert["location"],
@@ -679,11 +710,9 @@ async def save_and_notify(state: AgentState) -> AgentState:
         "rationale":              rec.get("rationale", ""),
         "confidence":             confidence,
         "similar_orders":         clean_similar,
-        "atlas_search_used":      len([
-            r for r in state.get("supplier_search_results", []) if "error" not in r
-        ]) > 0,
+        "atlas_search_used":      len([r for r in state.get("supplier_search_results", []) if "error" not in r]) > 0,
         "retrieval_trace":        state.get("retrieval_trace", []),
-        "status":                 status,
+        "status":                 "approved" if auto_approved else "awaiting_approval",
         "auto_approved":          auto_approved,
         "review_reason":          review_reason,
         "created_at":             datetime.now(timezone.utc),
@@ -691,90 +720,259 @@ async def save_and_notify(state: AgentState) -> AgentState:
     }
 
     result   = await _db_async.proposed_orders.insert_one(order)
-    order_id = str(result.inserted_id)
+    order_id = result.inserted_id
 
-    # Record confidence outcome for calibration tracking
     await _db_async.confidence_outcomes.insert_one({
-        "alert_id":              ObjectId(alert["_id"]),
-        "order_id":              result.inserted_id,
-        "predicted_confidence":  confidence,
-        "auto_approved":         auto_approved,
-        "human_decision":        None,
+        "alert_id":               ObjectId(alert["_id"]),
+        "order_id":               order_id,
+        "predicted_confidence":   confidence,
+        "auto_approved":          auto_approved,
+        "human_decision":         None,
         "days_to_stock_recovery": None,
-        "outcome":               "pending",
-        "recorded_at":           datetime.now(timezone.utc),
+        "outcome":                "pending",
+        "recorded_at":            datetime.now(timezone.utc),
     })
 
-    # Record agent decision in lifecycle log
-    loop_lc = asyncio.get_running_loop()
-    loop_lc.run_in_executor(
+    loop = asyncio.get_running_loop()
+    loop.run_in_executor(
         None, append_lifecycle_event,
         alert["_id"], "agent_decision",
-        {
-            "supplier":   rec.get("supplier_name"),
-            "quantity":   quantity,
-            "confidence": confidence,
-            "auto_approved": auto_approved,
-            "order_id":   order_id,
-        },
-        alert["sku"], alert["location"],
-    )
-    loop_lc.run_in_executor(
-        None, append_lifecycle_event,
-        alert["_id"], "order_placed",
-        {"order_id": order_id, "status": status},
+        {"supplier": rec.get("supplier_name"), "quantity": quantity,
+         "confidence": confidence, "auto_approved": auto_approved, "order_id": str(order_id)},
         alert["sku"], alert["location"],
     )
 
+    # ── Human-in-the-loop path ───────────────────────────────────────────────
+    if not auto_approved:
+        # Tag the alert so the Change Stream doesn't re-fire it while we wait.
+        await _db_async.reorder_alerts.update_one(
+            {"_id": ObjectId(alert["_id"])},
+            {"$set": {"status": "awaiting_human_approval", "order_id": order_id}},
+        )
+
+        log.info("order awaiting human approval — pausing graph", extra={
+            "phase": "save_order", "sku": alert["sku"],
+            "order_id": str(order_id), "review_reason": review_reason,
+        })
+
+        # ── GRAPH PAUSES HERE ────────────────────────────────────────────────
+        # LangGraph writes the full state to `checkpoints` (MongoDBSaver).
+        # The Streamlit dashboard resumes with Command(resume={...}).
+        # ─────────────────────────────────────────────────────────────────────
+        human_decision: dict = interrupt({
+            "order_id":       str(order_id),
+            "sku":            alert["sku"],
+            "location":       alert["location"],
+            "supplier":       rec.get("supplier_name"),
+            "quantity":       quantity,
+            "total_cost_usd": total_cost,
+            "review_reason":  review_reason,
+        })
+        # ── GRAPH RESUMES HERE (after dashboard calls Command(resume=...)) ───
+
+        approved = human_decision.get("approved", False)
+        approver = human_decision.get("approver", "human")
+
+        if approved:
+            await _db_async.proposed_orders.update_one(
+                {"_id": order_id},
+                {"$set": {"status": "approved", "approved_by": approver,
+                           "approved_at": datetime.now(timezone.utc)}},
+            )
+            await _db_async.inventory.update_one(
+                {"sku": alert["sku"], "location": alert["location"]},
+                {"$inc": {"on_order": quantity}},
+            )
+            await _db_async.confidence_outcomes.update_one(
+                {"order_id": order_id},
+                {"$set": {"human_decision": "approved", "outcome": "resolved"}},
+            )
+            await _db_async.reorder_alerts.update_one(
+                {"_id": ObjectId(alert["_id"])},
+                {"$set": {"status": "processed", "order_id": order_id}},
+            )
+            loop.run_in_executor(
+                None, append_lifecycle_event,
+                alert["_id"], "human_approved",
+                {"order_id": str(order_id), "approved_by": approver},
+                alert["sku"], alert["location"],
+            )
+            log.info("human approved order", extra={
+                "phase": "save_order", "sku": alert["sku"],
+                "order_id": str(order_id), "approved_by": approver,
+            })
+        else:
+            # Rejection: reset the alert to pending so the Change Stream re-fires
+            # and the agent retries with the rejection visible in short-term memory.
+            reason = human_decision.get("reason", "human_rejected")
+            await _db_async.proposed_orders.update_one(
+                {"_id": order_id}, {"$set": {"status": "rejected"}},
+            )
+            await _db_async.confidence_outcomes.update_one(
+                {"order_id": order_id},
+                {"$set": {"human_decision": "rejected", "outcome": "escalated"}},
+            )
+            await _db_async.reorder_alerts.update_one(
+                {"_id": ObjectId(alert["_id"])},
+                {
+                    "$set":   {"status": "pending"},
+                    "$unset": {"order_id": ""},
+                    "$inc":   {"rejection_count": 1},
+                },
+            )
+            loop.run_in_executor(
+                None, append_lifecycle_event,
+                alert["_id"], "human_rejected",
+                {"order_id": str(order_id), "reason": reason},
+                alert["sku"], alert["location"],
+            )
+            log.info("human rejected order, alert reset to pending", extra={
+                "phase": "save_order", "sku": alert["sku"], "order_id": str(order_id),
+            })
+
+        _explain(
+            f"Human decision received for {alert['sku']}: "
+            + ("APPROVED ✅ — memories will now be written." if approved
+               else "REJECTED ❌ — alert reset to pending for next agent run.")
+        )
+
+        return {
+            "order_id":             str(order_id),
+            "human_approved":       approved,
+            "final_recommendation": rec,
+        }
+
+    # ── Auto-approved path ───────────────────────────────────────────────────
     await _db_async.reorder_alerts.update_one(
         {"_id": ObjectId(alert["_id"])},
-        {"$set": {"status": "processed", "order_id": result.inserted_id}},
+        {"$set": {"status": "processed", "order_id": order_id}},
+    )
+    await _db_async.inventory.update_one(
+        {"sku": alert["sku"], "location": alert["location"]},
+        {"$inc": {"on_order": quantity}},
+    )
+    loop.run_in_executor(
+        None, append_lifecycle_event,
+        alert["_id"], "order_placed",
+        {"order_id": str(order_id), "status": "approved"},
+        alert["sku"], alert["location"],
     )
 
-    if auto_approved:
-        await _db_async.inventory.update_one(
-            {"sku": alert["sku"], "location": alert["location"]},
-            {"$inc": {"on_order": quantity}},
-        )
+    log.info("order auto-approved", extra={
+        "phase":                 "save_order",
+        "sku":                   alert["sku"],
+        "location":              alert.get("location"),
+        "order_id":              str(order_id),
+        "quantity":              quantity,
+        "total_cost":            total_cost,
+        "zero_order":            zero_order,
+        "similar_orders_stored": len(clean_similar),
+    })
+    return {
+        "order_id":             str(order_id),
+        "human_approved":       True,
+        "final_recommendation": rec,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Node 6b: write_memories — persist decision to all three memory layers
+# ---------------------------------------------------------------------------
+
+async def write_memories(state: AgentState) -> dict:
+    """Node 6b — Write the agent's decision to short-term, long-term, and order-history memory.
+
+    This node runs after save_order completes (whether auto-approved or
+    human-reviewed).  Separating memory writes into their own node keeps each
+    node focused on a single responsibility and makes the graph topology easier
+    to read for beginners.
+
+    Three memory layers written in parallel:
+    ┌─────────────────────────┬─────────────────────────────────────────────┐
+    │ Layer                   │ Purpose                                     │
+    ├─────────────────────────┼─────────────────────────────────────────────┤
+    │ short_term_memory       │ Exact decision for this SKU+location, 24 h  │
+    │                         │ TTL.  Prevents the agent from re-ordering   │
+    │                         │ the same item within the same day.          │
+    ├─────────────────────────┼─────────────────────────────────────────────┤
+    │ agent_memory            │ Semantic summary + Voyage AI embedding.     │
+    │                         │ Retrieved later via Atlas Vector Search     │
+    │                         │ (`get_learned_patterns` tool).              │
+    ├─────────────────────────┼─────────────────────────────────────────────┤
+    │ order_history           │ Full order record for future similarity     │
+    │                         │ lookup (`find_similar_past_orders` tool).   │
+    └─────────────────────────┴─────────────────────────────────────────────┘
+    """
+    alert    = state["alert"]
+    rec      = state.get("final_recommendation") or {}
+    approved = state.get("human_approved", True)
+
+    chosen     = next(
+        (s for s in state.get("suppliers", []) if s.get("supplier_id") == rec.get("supplier_id")),
+        {},
+    )
+    quantity   = rec.get("quantity", 0)
+    unit_price = chosen.get("unit_price", 0.0)
+    total_cost = round(quantity * unit_price, 2)
 
     days_remaining = alert.get("days_of_stock_remaining", 0)
     trend          = state.get("consumption", {}).get("trend", "stable")
     item_name      = state.get("inventory", {}).get("name", "")
     category       = state.get("inventory", {}).get("category", "unknown")
+
+    # order_id was stored as a string by save_order; convert back to ObjectId
+    # for order_history's proposed_order_id reference field.
+    order_id_str = state.get("order_id", "")
+    try:
+        order_id_obj = ObjectId(order_id_str)
+    except Exception:
+        order_id_obj = None
+
+    _explain(
+        f"Writing decision to memory for {alert['sku']} — "
+        f"short-term (24 h TTL), long-term semantic embedding, order history. "
+        f"Outcome: {'approved ✅' if approved else 'rejected ❌'}"
+    )
+
     loop = asyncio.get_running_loop()
     await asyncio.gather(
+        # ── short_term_memory ──────────────────────────────────────────────
+        # Simple find-or-upsert with a 24-hour TTL index.
+        # Shows: basic CRUD + TTL indexes in MongoDB.
         loop.run_in_executor(
             None, write_short_term_memory_sync,
-            alert["sku"], alert["location"], rec, days_remaining, auto_approved,
+            alert["sku"], alert["location"], rec, days_remaining, approved,
         ),
+        # ── agent_memory (long-term) ───────────────────────────────────────
+        # Generates a Voyage AI embedding of the decision summary and stores
+        # it in agent_memory.  Retrieved later with $vectorSearch.
+        # Shows: vector embeddings + Atlas Vector Search round-trip.
         loop.run_in_executor(
             None, write_long_term_memory_sync,
             alert["sku"], item_name, alert["location"],
-            rec, days_remaining, trend, auto_approved,
+            rec, days_remaining, trend, approved,
         ),
+        # ── order_history ──────────────────────────────────────────────────
+        # Detailed record of every order placed, used by find_similar_past_orders
+        # to seed the recommendation agent with historical context.
+        # Shows: aggregation-friendly schema design.
         loop.run_in_executor(
             None, write_order_history_sync,
             alert["sku"], alert["location"], category,
             rec.get("supplier_id"), rec.get("supplier_name", "N/A"),
             quantity, unit_price, total_cost,
-            days_remaining, trend,
-            rec.get("rationale", ""), result.inserted_id,
+            days_remaining, trend, rec.get("rationale", ""), order_id_obj,
         ),
     )
 
-    log.info("order saved", extra={
-        "phase":                 "save_and_notify",
-        "sku":                   alert["sku"],
-        "location":              alert.get("location"),
-        "order_id":              order_id,
-        "quantity":              quantity,
-        "total_cost":            order["total_cost"],
-        "status":                status,
-        "auto_approved":         auto_approved,
-        "zero_order":            zero_order,
-        "similar_orders_stored": len(clean_similar),
+    log.info("memories written", extra={
+        "phase":    "write_memories",
+        "sku":      alert["sku"],
+        "location": alert.get("location"),
+        "approved": approved,
+        "order_id": order_id_str,
     })
-    return {**state, "order_id": order_id}
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -808,15 +1006,20 @@ async def _notify_escalation_webhook(url: str, sku: str, alert: dict, reason: st
 
 
 async def escalate_alert(state: AgentState) -> AgentState:
-    """Write an escalation record after max audit retries are exhausted.
+    """Write an escalation record when recommend exhausts all validation retries.
 
-    Triggered by route_after_audit when audit_retries >= 2 and the
-    recommendation is still invalid.  Writes to escalation_queue, marks the
-    alert as 'escalated', and optionally POSTs a webhook notification.
+    Writes to escalation_queue, marks the alert as 'escalated', and
+    optionally POSTs a webhook notification.
     """
     alert  = state["alert"]
     sku    = alert.get("sku", "?")
-    reason = "audit_max_retries"
+    reason = "validation_max_retries"
+
+    _explain(
+        f"[escalate_alert] ⚠️  Escalating {sku} — the recommend node failed validation "
+        "after all retries without producing a valid order. "
+        "Writing to escalation_queue so a human specialist can investigate."
+    )
 
     alert_oid = ObjectId(alert["_id"]) if isinstance(alert["_id"], str) else alert["_id"]
 
@@ -838,7 +1041,6 @@ async def escalate_alert(state: AgentState) -> AgentState:
             "escalated_at":        datetime.now(timezone.utc),
             "rejection_history":   rejection_history,
             "last_recommendation": state.get("recommendation", {}),
-            "last_audit_errors":   state.get("audit_result", {}).get("errors", []),
             "escalation_reason":   reason,
         }},
         upsert=True,
@@ -858,7 +1060,7 @@ async def escalate_alert(state: AgentState) -> AgentState:
         "location": alert.get("location"),
         "reason":   reason,
     })
-    return {**state}
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -866,60 +1068,64 @@ async def escalate_alert(state: AgentState) -> AgentState:
 # ---------------------------------------------------------------------------
 
 def route_by_urgency(state: AgentState) -> str:
-    """Short-circuit to save_and_notify when coverage_gap is already zero."""
+    """Zero-gap fast path: skip the LLM and go straight to save_order.
+
+    If existing on-order stock already covers the reorder point there is
+    nothing to order.  save_order will write a synthetic zero-quantity record.
+    """
     if state.get("coverage_gap") == 0:
-        return "save_and_notify"
-    return "retrieval_agent"
+        return "save_order"
+    return "recommend"
 
 
-def route_after_audit(state: AgentState) -> str:
-    """Route after audit: valid → save, max retries → escalate, else → retry."""
-    if state.get("audit_result", {}).get("valid"):
-        return "save_and_notify"
-    if state.get("audit_retries", 0) >= 2:
-        log.warning("audit max retries reached, escalating", extra={
-            "phase": "audit_agent",
-            "sku":   state["alert"]["sku"],
+def route_after_recommend(state: AgentState) -> str:
+    """Route after recommend: escalate if validation failed, otherwise save."""
+    if state.get("escalate_flag"):
+        log.warning("recommend exhausted retries, escalating", extra={
+            "phase": "recommend", "sku": state["alert"]["sku"],
         })
         return "escalate"
-    return "recommendation_agent"
+    return "save_order"
 
 
 # ---------------------------------------------------------------------------
-# Graph construction
+# Graph construction — 5-node topology
+# ---------------------------------------------------------------------------
+#
+#   START
+#     → assess_alert
+#         ↘ save_order  (zero-gap fast path — no LLM needed)
+#         ↘ recommend   (retrieval + analysis + recommendation + validation)
+#               ↘ escalate    (validation exhausted)
+#               ↘ save_order  (valid recommendation)
+#                   → write_memories
+#     → END
+#
 # ---------------------------------------------------------------------------
 
 def build_graph():
     builder = StateGraph(AgentState)
 
-    builder.add_node("assess_alert",         assess_alert)
-    builder.add_node("retrieval_agent",      retrieval_agent_node)
-    builder.add_node("analysis_agent",       analysis_agent_node)
-    builder.add_node("recommendation_agent", recommendation_agent_node)
-    builder.add_node("audit_agent",          audit_agent_node)
-    builder.add_node("escalate",             escalate_alert)
-    builder.add_node("save_and_notify",      save_and_notify)
+    builder.add_node("assess_alert",   assess_alert)
+    builder.add_node("recommend",      recommend)
+    builder.add_node("escalate",       escalate_alert)
+    builder.add_node("save_order",     save_order)
+    builder.add_node("write_memories", write_memories)
 
     builder.add_edge(START, "assess_alert")
     builder.add_conditional_edges(
         "assess_alert",
         route_by_urgency,
-        {"save_and_notify": "save_and_notify", "retrieval_agent": "retrieval_agent"},
+        {"save_order": "save_order", "recommend": "recommend"},
     )
-    builder.add_edge("retrieval_agent",      "analysis_agent")
-    builder.add_edge("analysis_agent",       "recommendation_agent")
-    builder.add_edge("recommendation_agent", "audit_agent")
     builder.add_conditional_edges(
-        "audit_agent",
-        route_after_audit,
-        {
-            "save_and_notify":      "save_and_notify",
-            "recommendation_agent": "recommendation_agent",
-            "escalate":             "escalate",
-        },
+        "recommend",
+        route_after_recommend,
+        {"save_order": "save_order", "escalate": "escalate"},
     )
-    builder.add_edge("escalate",      END)
-    builder.add_edge("save_and_notify", END)
+    builder.add_edge("escalate",       END)
+    builder.add_edge("save_order",     "write_memories")
+    builder.add_edge("write_memories", END)
 
     checkpointer = MongoDBSaver(_sync_client, db_name="supply_chain_demo")
     return builder.compile(checkpointer=checkpointer)
@@ -962,7 +1168,7 @@ async def _process_one_alert(alert_doc: dict) -> None:
        racing to handle the same alert document.
     4. SKU-level distributed lock — prevents concurrent pipelines for the same
        (sku, location), closing the TOCTOU gap between assess_alert reading the
-       coverage gap and save_and_notify writing the order.
+       coverage gap and save_order writing the order.
     """
     sku       = alert_doc.get("sku", "?")
     location  = alert_doc.get("location", "")
@@ -1089,6 +1295,65 @@ async def _drain_existing_pending_alerts() -> None:
         log.info("startup: drained pre-existing pending alerts", extra={"count": count})
 
 
+# ---------------------------------------------------------------------------
+# Vector-dim preflight — catches index/model mismatches before they silently
+# produce zero search hits.  A mismatch only happens when the embedding model
+# is swapped without reseeding; this makes the failure loud and immediate.
+# ---------------------------------------------------------------------------
+
+#: Expected embedding dimensions for every vector index used by the agent.
+#: Update this dict whenever the embedding model or index definition changes.
+_VECTOR_INDEX_DIMS: dict[str, int] = {
+    "order_history_vector_index": 1024,   # voyage-4-large
+    "agent_memory_vector_index":  1024,   # voyage-4-large
+}
+
+
+def _assert_vector_index_dims() -> None:
+    """Verify that each Atlas Vector Search index has the expected numDimensions.
+
+    Queries the $listSearchIndexes pipeline.  Logs a WARNING (not a crash) when
+    an index is missing or has the wrong dimension — the agent can still run, but
+    vector search will return zero results until the index is rebuilt.
+    """
+    for collection_name, expected_dims in _VECTOR_INDEX_DIMS.items():
+        collection = _db_sync[collection_name]
+        try:
+            indexes = list(collection.aggregate([{"$listSearchIndexes": {}}]))
+        except Exception as exc:
+            log.warning(
+                "vector-dim preflight: could not list indexes",
+                extra={"collection": collection_name, "error": str(exc)},
+            )
+            continue
+
+        for idx in indexes:
+            fields = idx.get("latestDefinition", {}).get("fields", [])
+            for field in fields:
+                if field.get("type") == "vector":
+                    actual = field.get("numDimensions")
+                    if actual != expected_dims:
+                        log.warning(
+                            "vector index dimension mismatch — vector search will return zero hits",
+                            extra={
+                                "collection":   collection_name,
+                                "index":        idx.get("name"),
+                                "expected_dims": expected_dims,
+                                "actual_dims":  actual,
+                                "fix":          "re-run data/seed.py to rebuild the index",
+                            },
+                        )
+                    else:
+                        log.info(
+                            "vector index dims OK",
+                            extra={
+                                "collection": collection_name,
+                                "index":      idx.get("name"),
+                                "dims":       actual,
+                            },
+                        )
+
+
 async def watch_alerts() -> None:
     """Watch reorder_alerts via Change Stream and invoke the agent graph.
 
@@ -1106,6 +1371,8 @@ async def watch_alerts() -> None:
 
     await sku_lock.ensure_indexes(_db_async)
     log.info("sku_processing_locks indexes ensured")
+
+    _assert_vector_index_dims()
 
     await _drain_existing_pending_alerts()
 

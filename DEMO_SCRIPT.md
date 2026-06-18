@@ -11,6 +11,7 @@
 - Simulator is **running** (▶ Start pressed in sidebar — Status shows 🟢 Running)
 - Drain Speed slider is at **1× Normal** for a measured start
 - Confirm the agent is active: within ~30 seconds of starting you should see proposed orders appearing in the right column — if not, check `docker compose logs agent`
+- **Optional — Explain Mode:** run the agent with `EXPLAIN_MODE=1` to print plain-English node descriptions alongside the JSON logs. Useful if your audience wants to see the pipeline narrated in real time without reading structured log output: `EXPLAIN_MODE=1 python agent/graph.py`
 - Atlas UI open in a second tab (optional — useful for showing the Search / Vector Search indexes if the audience asks)
 - **Watch for these SKUs** — they have a seeded rising demand trend and will produce MEDIUM confidence even with stock above 5 days:
   - `MED-3017` (Insulin Glargine · DC-Texas · pharmaceutical)
@@ -150,13 +151,25 @@
 
 **👉 Find a `MEDIUM` confidence order with the AWAITING badge and click ❌ Reject.**
 
-> "If a human rejects an order, two things happen simultaneously.
-> First — the alert resets to pending and the Change Stream fires again.
-> The agent reprocesses it with a ⚠ HUMAN REJECTED tag visible in short-term memory.
+> "Watch what happens when I click Reject. This isn't a simple MongoDB write.
+> The graph actually paused at a node called `save_order` — LangGraph serialised
+> the entire agent state to the `checkpoints` collection via MongoDBSaver and waited.
+> When I click Reject, the dashboard calls `graph.invoke(Command(resume={'approved': False}))`.
+> LangGraph reloads that checkpoint from MongoDB, re-enters the node right where it
+> stopped, and runs the rejection logic — updating the order, the alert, the memory —
+> all inside the graph."
+>
+> "Open the `checkpoints` collection in Atlas while an order is awaiting review.
+> You'll see the complete agent state — suppliers, retrieval trace, recommendation,
+> memories — frozen in one document. That's the entire LangGraph + MongoDB story
+> in a single Atlas query."
+>
+> "After the rejection: the alert resets to pending, the Change Stream fires again,
+> and the agent reprocesses with a ⚠ HUMAN REJECTED tag visible in short-term memory.
 > The prompt requires the agent to change its approach — different supplier,
 > adjusted quantity — and explain what changed in the rationale."
 >
-> "Second — the rejection is written to long-term memory as an embedded document.
+> "The rejection is also written to long-term memory as an embedded document.
 > Human oversight becomes a persistent training signal, not just a one-time gate."
 
 *Contingency: if the reprocessed order takes more than 30 seconds, point at the Demo Status panel and watch the Long-term Memories counter increment — that's the memory write completing in the background.*
@@ -203,11 +216,14 @@
 **👉 Open Admin Panel → 🔁 Agent Recovery Log.**
 
 > "LangGraph checkpoints every node transition to MongoDB via MongoDBSaver.
+> That's the same collection that stores the pause-point when `interrupt()` fires —
+> one collection, two jobs: crash recovery and human-in-the-loop state.
 > If the agent process crashes mid-pipeline, the next invocation resumes from
 > the last checkpoint rather than starting from scratch.
 > This panel reads those checkpoints directly and shows each pipeline run:
 > SKU, last node executed, step count, and outcome — completed, re-queued,
-> escalated, or recovered mid-pipeline. Crash recovery, made visible."
+> escalated, or recovered mid-pipeline. Crash recovery and human review,
+> both made visible through the same MongoDB collection."
 
 ---
 
@@ -244,7 +260,7 @@
 |---|---|
 | No new alert appears | Bump Drain Speed to 3× — alerts fire within seconds; return to 1× after |
 | Agent decision takes > 45 s | Continue talking through the pipeline description; point at a completed order from an earlier alert |
-| Reprocessed order after reject takes > 30 s | Point at Long-term Memories counter in Demo Status — watch it increment |
+| Reprocessed order after reject takes > 30 s | Point at Long-term Memories counter in Demo Status — watch it increment; mention `write_memories` node running in background |
 | Atlas Search / $rankFusion error | The UI falls back to regex automatically; mention "graceful degradation" as a feature |
 | Agent Recovery Log is empty | Demo was just reset; process one alert first, then reopen the expander |
 

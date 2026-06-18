@@ -31,26 +31,21 @@ For node-by-node agent diagrams see [WORKFLOW.md](WORKFLOW.md).
 START
   → assess_alert
   → route_by_urgency (conditional)
-      ↘ save_and_notify          (zero-gap fast path — no LLM)
-      ↘ retrieval_agent          (ReAct loop, max 4 tool iterations)
-          → analysis_agent
-              → recommendation_agent
-                  → audit_agent (conditional)
-                      ↘ recommendation_agent  (retry, max 2×)
-                      ↘ escalate              (dead-letter on max retries)
-                      ↘ save_and_notify
+      ↘ save_order    (zero-gap fast path — no LLM)
+      ↘ recommend     (retrieval + analysis + recommendation + validation)
+          ↘ escalate  (validation exhausted after all retries)
+          ↘ save_order
+              → write_memories    (short-term, long-term, history)
 END
 ```
 
 | Node | What it does |
 |---|---|
 | `assess_alert` | Fetches live inventory position from MongoDB; sums active orders to compute `coverage_gap`; sets `expedite` flag when `< 2 days` remaining |
-| `route_by_urgency` | Conditional edge — zero-gap alerts skip all LLM nodes; everything else proceeds to the ReAct retrieval agent |
-| `retrieval_agent` | **ReAct agent** — LLM decides which tools to call and in what order; populates `retrieval_results` and `retrieval_trace` in state |
-| `analysis_agent` | Evaluates suppliers; outputs `analysis` dict with `best_supplier_id`, `confidence`, `risk_flags`, and a `reasoning_trace`; **no quantity calculation** |
-| `recommendation_agent` | Receives analysis output; calculates quantity and writes rationale; outputs full `recommendation` dict |
-| `audit_agent` | Validates recommendation schema, policy rules, and FDA regulatory constraints (pharmaceutical and laboratory SKUs must use an FDA-registered supplier); retries `recommendation_agent` up to 2× on failure; routes to `escalate` on max retries |
-| `save_and_notify` | Writes `proposed_orders`; **auto-approves** if confidence is `high` and cost `< $5,000`; orders routed to human review include a `review_reason` field (`"budget_threshold ($X ≥ $5,000 limit)"` or low-confidence); writes short-term and long-term memory; records `confidence_outcomes` entry |
+| `route_by_urgency` | Conditional edge — zero-gap alerts skip the LLM entirely; everything else goes to `recommend` |
+| `recommend` | **The core reasoning node.** Runs a ReAct tool-calling loop to gather context (Atlas Search, Vector Search, time series, memory), then calls the LLM twice — once for supplier analysis (confidence score) and once for the order recommendation (quantity + rationale). Validates inline; retries up to 3× before setting `escalate_flag` |
+| `save_order` | Writes `proposed_orders`; **auto-approves** if confidence is `high` and cost `< $5,000`; otherwise calls **`interrupt()`** — LangGraph freezes the graph state to the `checkpoints` collection (MongoDBSaver) and waits for a human decision; the dashboard resumes with `Command(resume={...})` |
+| `write_memories` | Runs after `save_order` completes; writes short-term memory (24 h TTL), long-term semantic embedding (`agent_memory`), and order history in parallel |
 | `escalate` | Writes to `escalation_queue`; sets alert status to `"escalated"`; optionally POSTs a webhook notification |
 
 Every graph invocation is checkpointed to MongoDB via **LangGraph `MongoDBSaver`** (`checkpoints` collection).
@@ -74,7 +69,7 @@ Short-term and long-term memories are injected directly into the recommendation 
 
 ### The problem
 
-Between the moment `assess_alert` reads the inventory gap and the moment `save_and_notify` writes the order (~20–30 s of LLM pipeline), a second alert for the same SKU+location could arrive, pass the same gap check, and result in a duplicate order. This TOCTOU (time-of-check/time-of-use) race is real when multiple workers run concurrently.
+Between the moment `assess_alert` reads the inventory gap and the moment `save_order` writes the order (~20–30 s of LLM pipeline), a second alert for the same SKU+location could arrive, pass the same gap check, and result in a duplicate order. This TOCTOU (time-of-check/time-of-use) race is real when multiple workers run concurrently.
 
 ### The fix — two layers of mutual exclusion
 
@@ -108,7 +103,7 @@ claim alert-1 ✓                   claim alert-2 ✓
 acquire SKU lock ✓                acquire SKU lock ✗ (retrying…)
 assess_alert → coverage_gap=155
 [LLM pipeline ~20 s]
-save_and_notify → order written
+save_order → order written
 release SKU lock                  acquire SKU lock ✓
                                   assess_alert → coverage_gap=0
                                   zero-gap fast path → no order
@@ -126,7 +121,9 @@ Orders are automatically set to `status: approved` when **both** conditions are 
 
 Zero-quantity orders (zero-gap fast path) are always auto-approved regardless of cost.
 
-Orders that do not meet both conditions are routed to human review with a `review_reason` field on the order document. The value is `"budget_threshold ($X ≥ $5,000 limit)"` for cost-driven routing, or `"low_confidence"` / `"medium_confidence"` for confidence-driven routing. The dashboard surfaces this as a `⚠ REVIEW: <reason>` badge on awaiting-approval order cards.
+Orders that do not meet both conditions are routed to human review. `save_order` calls LangGraph's **`interrupt()`**, which serialises the full graph state to the `checkpoints` collection (MongoDBSaver) and pauses the graph. The dashboard detects `status: awaiting_approval`, surfaces the review card, and on button click calls `graph.invoke(Command(resume={"approved": True}))` to reload the checkpoint and continue the graph from where it stopped. The order document carries a `review_reason` field (`"budget_threshold ($X ≥ $5,000 limit)"` or `"confidence=medium"`) shown as a `⚠ REVIEW: <reason>` badge in the dashboard.
+
+> **Teaching moment:** while a graph is paused you can open the `checkpoints` collection in Atlas and see the entire agent state frozen in a single document — suppliers, retrieval trace, recommendation, memories — all serialised by MongoDBSaver.
 
 ### Confidence level criteria
 
@@ -157,7 +154,7 @@ The LLM client tracks consecutive failures. After **3 consecutive failures** the
 
 ### Short-term (`short_term_memory`)
 
-One record per `save_and_notify` / human decision. Includes `decided_by`, `human_decision`, supplier, quantity, confidence. Rendered in the recommendation agent prompt with visual tags:
+One record per `write_memories` run (after auto-approval or after a human decision is received via `interrupt()` resume). Includes `decided_by`, `human_decision`, supplier, quantity, confidence. Rendered in the recommendation agent prompt with visual tags:
 - `⚠ HUMAN REJECTED` — agent must change approach
 - `✓ HUMAN APPROVED` — strong reuse signal
 - `AUTO-APPROVED` — agent's own prior decisions
@@ -246,6 +243,7 @@ FALLBACK_MODEL=gpt-4o
 FALLBACK_API_BASE_URL=<alternate-openai-base>
 ESCALATION_WEBHOOK_URL=<webhook-url>
 LOG_LEVEL=INFO
+EXPLAIN_MODE=1           # print plain-English node descriptions (learning/demo aid)
 ```
 
 ### 3. (Optional) Configure dashboard authentication
@@ -326,8 +324,9 @@ source .venv/bin/activate
 # Terminal 1 — stream simulator
 python simulator/stream_simulator.py
 
-# Terminal 2 — agent
+# Terminal 2 — agent (add EXPLAIN_MODE=1 for plain-English node descriptions)
 python agent/graph.py
+# or: EXPLAIN_MODE=1 python agent/graph.py
 
 # Terminal 3 — dashboard
 streamlit run app.py
@@ -393,13 +392,21 @@ Aggregation table showing how well predicted confidence (`high`/`medium`/`low`) 
 | Procedure candidate review | Expander listing `procedures` docs where `human_confirmed: False`; per-rule ✅ Confirm and 🗑 Dismiss buttons; confirmed rules are passed to the agent via `get_applicable_procedures` tool |
 | 🔁 Agent Recovery Log | Expander that reads the `checkpoints` collection (LangGraph `MongoDBSaver`), groups by `thread_id` (= alert `_id`), and shows each pipeline run: SKU, location, last node executed, step count, and run outcome (completed ✅ / re-queued 🔄 / escalated 🔺 / recovered mid-pipeline ⚡) |
 
-### Reject flow
+### Human-in-the-Loop flow
 
-When an order is rejected:
-1. `proposed_orders.status` → `"rejected"`.
-2. `rejection_count` on `reorder_alert` is incremented.
-3. Human-decision memory entries (`decided_by: "human"`, `human_decision: "rejected"`) are written to both memory layers.
-4. The alert resets to `"pending"` — the Change Stream fires again and the agent reprocesses with the rejection visible in short-term memory (`⚠ HUMAN REJECTED` tag).
+When `save_order` determines an order needs human review it calls `interrupt()`. LangGraph writes the full graph state to `checkpoints` (MongoDBSaver) and the graph pauses. The dashboard surfaces the review card.
+
+**Approve:**
+1. Dashboard calls `graph.invoke(Command(resume={"approved": True, "approver": "jsmith"}))`.
+2. LangGraph reloads the checkpoint, re-enters `save_order` after the `interrupt()` call.
+3. `proposed_orders.status` → `"approved"`; `inventory.on_order` incremented.
+4. Graph continues to `write_memories` — short-term and long-term memory reflect the human approval.
+
+**Reject:**
+1. Dashboard calls `graph.invoke(Command(resume={"approved": False, "reason": "wrong supplier"}))`.
+2. `proposed_orders.status` → `"rejected"`; `rejection_count` on the alert incremented.
+3. Alert resets to `"pending"` — the Change Stream fires again and the agent reprocesses with the rejection visible in short-term memory (`⚠ HUMAN REJECTED` tag).
+4. `write_memories` is still called, writing the rejection to both memory layers as a persistent learning signal.
 5. If `rejection_count >= 3`, the next processing cycle escalates directly without running the graph.
 
 ---
@@ -458,8 +465,8 @@ python3 -m pytest tests/test_coordination/ -v
 | Module | Location | What is tested |
 |---|---|---|
 | Coverage gap logic | `test_nodes/test_assess_alert.py` | Gap calculation, expedite flag, boundary conditions |
-| Auto-approve thresholds | `test_nodes/test_save_and_notify.py` | High-confidence auto-approval, zero-gap path, cost threshold |
-| Audit routing | `test_nodes/test_audit_agent.py` | Validation rules, retry count, escalation routing |
+| Auto-approve thresholds | `test_nodes/test_save_order.py` | High-confidence auto-approval, zero-gap path, cost threshold, interrupt() pause |
+| Recommend validation | `test_nodes/test_recommend.py` | Validation rules, retry logic, escalation flag |
 | Consumption trend | `test_tools/test_consumption_trend.py` | Avg daily calculation, trend direction |
 | Memory read/write | `test_tools/test_memory_read_write.py` | Short-term insert, read, TTL filtering |
 | Context budget | `test_tools/test_context_budget.py` | Token counting, trim priority order |
@@ -527,8 +534,9 @@ Supply_Chain_Reorder_Agent/
 │   ├── conftest.py                  # fixtures: test_db, mock LLM, mock Voyage AI
 │   ├── test_nodes/
 │   │   ├── test_assess_alert.py     # coverage gap + expedite logic
-│   │   ├── test_save_and_notify.py  # auto-approve thresholds, zero-gap path
-│   │   └── test_audit_agent.py      # validation rules, retry routing
+│   │   ├── test_save_order.py       # auto-approve thresholds, zero-gap path, interrupt() pause
+│   │   ├── test_write_memories.py   # memory writes after approval / rejection
+│   │   └── test_recommend.py        # validation rules, retry logic, escalation flag
 │   ├── test_tools/
 │   │   ├── test_consumption_trend.py
 │   │   ├── test_memory_read_write.py
@@ -578,9 +586,10 @@ Supply_Chain_Reorder_Agent/
 | **Atlas Search** | Supplier capability search via `$rankFusion` (two named `$search` sub-pipelines merged via Reciprocal Rank Fusion); falls back to compound `$search` on M0 tier; powers sidebar Supplier Search |
 | **`$rankFusion` / Reciprocal Rank Fusion** | Two independent named `$search` pipelines (`name_match` at 0.4 weight, `capability_match` at 0.6 weight) merged via RRF so a supplier ranking highly in either path rises to the top regardless of raw score scale |
 | **Atlas Vector Search** | Category-filtered search on `order_history`; location-filterable search on `agent_memory` |
-| **FDA regulatory hard filter** | `audit_agent` calls `validate_recommendation()` in `agent/tools.py`; pharmaceutical and laboratory SKUs are rejected and retried if the recommended supplier does not have `fda_registered: True`; constraint is also stated in `ANALYSIS_SYSTEM_PROMPT` |
+| **FDA regulatory hard filter** | `recommend` calls `validate_recommendation()` in `agent/tools.py` after each LLM call; pharmaceutical and laboratory SKUs are rejected and retried if the supplier does not have `fda_registered: True`; constraint is also stated in `ANALYSIS_SYSTEM_PROMPT` |
 | **ROP health check** | `app.py` aggregates 30-day average consumption from `consumption_history` and best lead time from `suppliers` in two batch queries; each inventory card shows a ✅ / ⚠️ / 🔴 ROP health indicator; a **📐 ROP Health** KPI card counts at-risk SKUs |
-| **LangGraph MongoDBSaver** | Checkpoints full graph state to `checkpoints` per alert invocation |
+| **LangGraph MongoDBSaver** | Checkpoints full graph state to `checkpoints` per alert invocation; also the pause-point when `interrupt()` fires — open Atlas during a human-review pause to see the entire agent state frozen in one document |
+| **`interrupt()` / `Command(resume=...)`** | LangGraph native HITL primitive used in `save_order`; pauses the graph at the node level; resumed by the dashboard calling `graph.invoke(Command(resume={...}))` with the human's decision |
 | **Atomic `findOneAndUpdate`** | Alert claim (pending → processing) prevents two workers racing on the same document |
 
 > **Note on Atlas Stream Processing:** In production, `stream_simulator.py` would be replaced by an Atlas Stream Processing pipeline consuming from Apache Kafka. The agent code is identical regardless — it only sees the `reorder_alerts` collection.
@@ -591,9 +600,9 @@ Supply_Chain_Reorder_Agent/
 
 1. **`$rankFusion` hybrid search** — supplier search uses two independent `$search` pipelines (name-match and capability-notes) merged via Reciprocal Rank Fusion, giving more robust ranking than a single compound query. Falls back to compound `$search` on M0 tier.
 
-2. **Budget authority thresholds** — the auto-approve ceiling is `$5,000` (module constant `_AUTO_APPROVE_MAX_USD = 5_000.00` in `agent/graph.py`). Orders at or above this threshold are routed to human review with a `review_reason` field surfaced as a `⚠ REVIEW` badge in the dashboard.
+2. **Budget authority thresholds** — the auto-approve ceiling is `$5,000` (module constant `_AUTO_APPROVE_MAX_USD = 5_000.00` in `agent/graph.py`). Orders at or above this threshold are routed to human review: `save_order` calls `interrupt()`, the graph pauses, and the dashboard resumes it with `Command(resume={"approved": True})`. The `review_reason` field on the order document is surfaced as a `⚠ REVIEW` badge in the dashboard.
 
-3. **FDA regulatory enforcement** — `validate_recommendation()` in `agent/tools.py` rejects any recommendation that assigns a non-FDA-registered supplier to a pharmaceutical or laboratory SKU. The `audit_agent` retries the recommendation pipeline on violation. Three suppliers (SUP-004, SUP-010, SUP-014) have `fda_registered: False` in the seeded data.
+3. **FDA regulatory enforcement** — `validate_recommendation()` in `agent/tools.py` rejects any recommendation that assigns a non-FDA-registered supplier to a pharmaceutical or laboratory SKU. The `recommend` node retries inline on violation. Three suppliers (SUP-004, SUP-010, SUP-014) have `fda_registered: False` in the seeded data.
 
 4. **ROP health monitoring** — each inventory card shows a per-SKU reorder-point health indicator (✅ covered / ⚠️ safety-stock bridge / 🔴 undercalibrated). A KPI card counts at-risk SKUs across the full inventory. Computed via two O(1) batch aggregations per dashboard refresh.
 
