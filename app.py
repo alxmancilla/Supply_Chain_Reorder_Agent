@@ -8,6 +8,7 @@ Layout:
   Right panel — active alerts + agent decisions (severity-badged cards)
 """
 
+import asyncio
 import os
 import time
 from datetime import datetime, timedelta, timezone
@@ -128,9 +129,14 @@ def _resume_graph(thread_id: str, decision: dict) -> None:
     if _agent_graph is None:
         return   # fallback: graph unavailable, dashboard will do direct writes
     try:
-        _agent_graph.invoke(
-            Command(resume=decision),
-            config={"configurable": {"thread_id": thread_id}},
+        # save_order is an async node — must use the async API.
+        # asyncio.run() creates a fresh event loop; safe in Streamlit's
+        # synchronous script context (no running loop in the script thread).
+        asyncio.run(
+            _agent_graph.ainvoke(
+                Command(resume=decision),
+                config={"configurable": {"thread_id": thread_id}},
+            )
         )
     except Exception as exc:
         # Log but don't crash the dashboard — the approve/reject write in session

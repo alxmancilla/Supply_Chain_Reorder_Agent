@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 
 import voyageai
 from dotenv import load_dotenv
+from bson import ObjectId
 from pymongo import MongoClient, ASCENDING
 
 load_dotenv()
@@ -835,6 +836,97 @@ ORDER_HISTORY = [
 # Helpers
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Historical proposed_orders — pre-seeds the procedure extractor so candidate
+# rules are visible in the dashboard on day 1 of a demo.
+#
+# Two clusters (each ≥ _MIN_APPROVALS = 5 within the 30-day look-back):
+#   pharmaceutical @ DC-Texas → BioPharm Global (SUP-003)  6 orders
+#   surgical       @ DC-Ohio  → SafeGlove Co    (SUP-005)  6 orders
+#
+# Rules are left at human_confirmed=False so the confirmation step in the
+# Streamlit dashboard is still visible during the demo.
+# ---------------------------------------------------------------------------
+_SEED_ORDERS: list[dict] = [
+    # ── pharmaceutical @ DC-Texas → BioPharm Global (SUP-003) ──────────────
+    {"sku": "MED-3017", "location": "DC-Texas",
+     "supplier_id": "SUP-003", "supplier_name": "BioPharm Global",
+     "quantity_recommended": 3600, "unit_price": 11.80, "total_cost": 42480.00,
+     "expected_delivery_days": 10, "confidence": "high", "auto_approved": True,
+     "rationale": "Monthly Insulin Glargine replenishment. BioPharm Global selected for cold-chain compliance and 98.5% fill rate.",
+     "days_ago": 28},
+    {"sku": "MED-3017", "location": "DC-Texas",
+     "supplier_id": "SUP-003", "supplier_name": "BioPharm Global",
+     "quantity_recommended": 3600, "unit_price": 11.80, "total_cost": 42480.00,
+     "expected_delivery_days": 10, "confidence": "high", "auto_approved": True,
+     "rationale": "Insulin Glargine reorder. Rising consumption trend; BioPharm Global preferred for biologics cold-chain.",
+     "days_ago": 23},
+    {"sku": "MED-3017", "location": "DC-Texas",
+     "supplier_id": "SUP-003", "supplier_name": "BioPharm Global",
+     "quantity_recommended": 3800, "unit_price": 11.80, "total_cost": 44840.00,
+     "expected_delivery_days": 10, "confidence": "high", "auto_approved": False,
+     "rationale": "Insulin stock at 3.1 days. BioPharm Global selected for GDP compliance and cold-chain capability.",
+     "days_ago": 18},
+    {"sku": "MED-3017", "location": "DC-Texas",
+     "supplier_id": "SUP-003", "supplier_name": "BioPharm Global",
+     "quantity_recommended": 3600, "unit_price": 11.80, "total_cost": 42480.00,
+     "expected_delivery_days": 10, "confidence": "high", "auto_approved": True,
+     "rationale": "Routine Insulin Glargine top-up. BioPharm Global preferred for 96% on-time delivery.",
+     "days_ago": 14},
+    {"sku": "MED-3017", "location": "DC-Texas",
+     "supplier_id": "SUP-003", "supplier_name": "BioPharm Global",
+     "quantity_recommended": 4000, "unit_price": 11.80, "total_cost": 47200.00,
+     "expected_delivery_days": 10, "confidence": "high", "auto_approved": False,
+     "rationale": "Insulin demand spike from new hospital contract. Emergency order BioPharm Global cold-chain delivery.",
+     "days_ago": 9},
+    {"sku": "MED-3017", "location": "DC-Texas",
+     "supplier_id": "SUP-003", "supplier_name": "BioPharm Global",
+     "quantity_recommended": 3600, "unit_price": 11.80, "total_cost": 42480.00,
+     "expected_delivery_days": 10, "confidence": "high", "auto_approved": True,
+     "rationale": "Scheduled Insulin Glargine replenishment. BioPharm Global — preferred pharmaceutical biologics supplier.",
+     "days_ago": 4},
+
+    # ── surgical @ DC-Ohio → SafeGlove Co (SUP-005) ─────────────────────────
+    {"sku": "SURG-0084", "location": "DC-Ohio",
+     "supplier_id": "SUP-005", "supplier_name": "SafeGlove Co",
+     "quantity_recommended": 540, "unit_price": 8.50, "total_cost": 4590.00,
+     "expected_delivery_days": 3, "confidence": "high", "auto_approved": True,
+     "rationale": "Nitrile gloves reorder. SafeGlove Co preferred for 99% fill rate and 3-day lead time.",
+     "days_ago": 27},
+    {"sku": "SURG-0084", "location": "DC-Ohio",
+     "supplier_id": "SUP-005", "supplier_name": "SafeGlove Co",
+     "quantity_recommended": 600, "unit_price": 8.50, "total_cost": 5100.00,
+     "expected_delivery_days": 3, "confidence": "high", "auto_approved": True,
+     "rationale": "PPE surge reorder. SafeGlove Co selected for fastest lead time during elevated surgical volume.",
+     "days_ago": 21},
+    {"sku": "SURG-0084", "location": "DC-Ohio",
+     "supplier_id": "SUP-005", "supplier_name": "SafeGlove Co",
+     "quantity_recommended": 540, "unit_price": 8.50, "total_cost": 4590.00,
+     "expected_delivery_days": 3, "confidence": "high", "auto_approved": True,
+     "rationale": "Routine glove replenishment. SafeGlove Co chosen for rapid fulfillment capability.",
+     "days_ago": 16},
+    {"sku": "SURG-0084", "location": "DC-Ohio",
+     "supplier_id": "SUP-005", "supplier_name": "SafeGlove Co",
+     "quantity_recommended": 600, "unit_price": 8.50, "total_cost": 5100.00,
+     "expected_delivery_days": 3, "confidence": "high", "auto_approved": False,
+     "rationale": "Nitrile gloves critically low. SafeGlove Co emergency fulfillment for patient safety.",
+     "days_ago": 11},
+    {"sku": "SURG-0084", "location": "DC-Ohio",
+     "supplier_id": "SUP-005", "supplier_name": "SafeGlove Co",
+     "quantity_recommended": 540, "unit_price": 8.50, "total_cost": 4590.00,
+     "expected_delivery_days": 3, "confidence": "high", "auto_approved": True,
+     "rationale": "Monthly glove stock restoration. SafeGlove Co preferred for FDA 510(k) compliance and fill rate.",
+     "days_ago": 6},
+    {"sku": "SURG-0084", "location": "DC-Ohio",
+     "supplier_id": "SUP-005", "supplier_name": "SafeGlove Co",
+     "quantity_recommended": 580, "unit_price": 8.50, "total_cost": 4930.00,
+     "expected_delivery_days": 3, "confidence": "high", "auto_approved": True,
+     "rationale": "Nitrile glove top-up before weekend surgical schedule. SafeGlove Co selected for reliability.",
+     "days_ago": 2},
+
+]
+
+
 def _get_embedding(text: str) -> list:
     """Embed a text string using Voyage AI voyage-4-large."""
     result = voyage_client.embed([text], model=EMBEDDING_MODEL, input_type="document")
@@ -987,6 +1079,82 @@ def seed_order_history() -> None:
     db.order_history.insert_many(docs)
     embedded = len(ORDER_HISTORY) - failed
     print(f"\n  Inserted {len(docs)} historical orders ({embedded} with embeddings, {failed} without)")
+
+
+def seed_proposed_orders() -> None:
+    """Insert historical approved proposed_orders to pre-seed the procedure extractor.
+
+    Creates ≥5 approved orders per (supplier, category, location) cluster so
+    seed_procedure_candidates() can immediately extract candidate rules without
+    waiting for the demo to accumulate real orders.
+
+    All dates fall within the 30-day look-back window of procedure_extractor.py.
+    alert_id is a synthetic ObjectId — these records have no corresponding
+    reorder_alert document (they represent pre-existing procurement history).
+    """
+    print("Seeding historical proposed_orders for procedure extraction …")
+    now = datetime.now(timezone.utc)
+    docs = []
+    for order in _SEED_ORDERS:
+        created_at = now - timedelta(days=order["days_ago"])
+        docs.append({
+            "sku":                    order["sku"],
+            "location":               order["location"],
+            "supplier_id":            order["supplier_id"],
+            "supplier_name":          order["supplier_name"],
+            "quantity_recommended":   order["quantity_recommended"],
+            "unit_price":             order["unit_price"],
+            "total_cost":             order["total_cost"],
+            "expected_delivery_days": order["expected_delivery_days"],
+            "rationale":              order["rationale"],
+            "confidence":             order["confidence"],
+            "similar_orders":         [],
+            "atlas_search_used":      True,
+            "retrieval_trace":        [],
+            # "received" = already delivered.
+            # The simulator's deliver_pending_orders() only queries "approved"
+            # orders — using "received" here prevents it from re-delivering
+            # these seeded orders and inflating on_hand at startup.
+            # The procedure extractor queries status in ["approved", "received"]
+            # so it still discovers these records.
+            # assess_alert's existing_order_qty only counts ["awaiting_approval",
+            # "approved"], so these records don't create a false coverage gap.
+            "status":                 "received",
+            "auto_approved":          order["auto_approved"],
+            "review_reason":          None,
+            "created_at":             created_at,
+            "alert_id":               ObjectId(),   # synthetic — no real alert doc
+        })
+    db.proposed_orders.insert_many(docs)
+    human_ct = sum(1 for o in _SEED_ORDERS if not o["auto_approved"])
+    auto_ct  = len(_SEED_ORDERS) - human_ct
+    print(f"  Inserted {len(docs)} historical approved orders "
+          f"({auto_ct} auto-approved, {human_ct} human-approved)")
+
+
+def seed_procedure_candidates() -> None:
+    """Run the procedure extractor to derive candidate rules from seeded orders.
+
+    Writes rules with human_confirmed=False so the confirmation step is still
+    visible in the Streamlit dashboard during the demo.
+    """
+    print("Extracting procedure candidates from seeded proposed_orders …")
+    try:
+        import sys
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from agent.procedure_extractor import extract_procedures
+        rules = extract_procedures()
+        if rules:
+            print(f"  ✓ {len(rules)} candidate rule(s) written (human_confirmed=False)")
+            for r in rules:
+                print(f"    {r['sku_category']} @ {r['location']} → "
+                      f"{r['preferred_supplier_name']} "
+                      f"(evidence={r['evidence_count']})")
+        else:
+            print("  No new rules extracted (already exist or threshold not met)")
+    except Exception as exc:
+        print(f"  [WARN] Procedure extraction failed: {exc}")
+        print("  Run 'python agent/procedure_extractor.py' manually after seeding.")
 
 
 def seed_clear_alerts_and_orders() -> None:
@@ -1243,7 +1411,9 @@ if __name__ == "__main__":
         print("  Inventory and supplier data are intact. Vector Search will be unavailable.")
         print("  Fix the Voyage AI credentials and re-run seed.py to add embeddings.")
     seed_clear_alerts_and_orders()
+    seed_proposed_orders()        # historical approved orders → feeds procedure extractor
     create_atlas_indexes()
     seed_initial_alerts()
+    seed_procedure_candidates()   # derive candidate rules → visible in dashboard
     print("\nSeed complete.")
     print("Run 'python simulator/stream_simulator.py' and 'python agent/graph.py' to start the demo.")
