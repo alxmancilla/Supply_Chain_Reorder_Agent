@@ -6,8 +6,11 @@
 ## 0 · Before you start (setup, not spoken)
 
 - `docker compose up --build` is running; seeder has completed.
+- Optional detached start: `docker compose up --build -d`.
+- Verify `docker compose ps` shows `app`, `agent`, `simulator`, and `memory-retry-worker` as `Up`.
+- Verify `docker compose logs seeder` ends with `Seed complete.` and the Atlas Search / Vector Search indexes are ready.
 - Browser open at **http://localhost:8501**.
-- Click **🔄 Reset Demo** if you need a clean baseline.
+- Startup may already create awaiting-approval orders from seeded below-ROP alerts. Click **🔄 Reset Demo** if you need a clean baseline.
 - Open **Admin Panel → 🎯 Prepare Context Scenario**. This pauses the simulator and creates a deterministic `MED-3017 @ DC-Texas` alert with:
   - live inventory below reorder point
   - rising demand trend from seeded time-series data
@@ -15,8 +18,10 @@
   - a recent `⚠ HUMAN REJECTED` short-term memory
   - a confirmed procedural rule preferring BioPharm Global
 - Confirm the new alert appears in **Active Alerts**.
+- Wait for a new MED-3017 proposed order, then use that order card for the Context Packet walkthrough.
 - Optional: keep Atlas UI open to show `reorder_alerts`, `proposed_orders`, `checkpoints`, `short_term_memory`, and `order_history`.
 - Optional: run the agent with `EXPLAIN_MODE=1` if you want narrated node logs.
+- Stop the stack after rehearsal with `docker compose down`.
 
 ---
 
@@ -57,6 +62,8 @@
 ## 3 · Open the Context Packet `[1:10 – 2:30]`
 
 **Open the latest order card → `💬 Rationale / 📦 Context Packet`.**
+
+If older seeded orders are visible, use the newest `MED-3017 @ DC-Texas` order created after **🎯 Prepare Context Scenario**.
 
 > "This is the center of the demo. The agent persisted a context manifest with the
 > order, so we can inspect what context was used, why it was included, and how it
@@ -120,6 +127,12 @@ Call out these rows if present:
 
 > "This order is held because confidence or budget policy requires a human. The
 > graph pauses with LangGraph `interrupt()` and stores the checkpoint in MongoDB."
+
+**If the order auto-approved:**
+
+> "This path still writes the same context manifest and memory records. For the
+> human-feedback segment, use another awaiting-review order or reset and rerun
+> the prepared scenario."
 
 ---
 
@@ -204,11 +217,14 @@ Call out these rows if present:
 | Situation | Response |
 |---|---|
 | No order appears | Confirm agent container is running: `docker compose logs agent`; the prepared alert should process without waiting for simulator drain. |
+| Services are not running | Run `docker compose ps`; start with `docker compose up --build -d`; stop with `docker compose down`. |
 | Context Packet is missing | Use a newly generated order; older orders created before this feature do not have `context_manifest`. |
+| Latest order is not MED-3017 | Use the newest MED-3017 order created after Prepare Context Scenario, or click Reset Demo and prepare the scenario again. |
 | Vector Search has no hits | Mention graceful degradation; the Context Packet still shows supplier, trend, memory, and validation context. |
 | Reprocessed order takes time | Explain that the graph writes memory before requeueing so the next run sees the rejection. |
 | Agent Recovery Log is empty | Process one alert first; checkpoints appear after graph execution. |
 | Too many old cards | Click Reset Demo, then Prepare Context Scenario again. |
+| LangGraph deprecation warning in logs | Non-blocking for this demo; continue unless the agent logs an exception or exits. |
 
 ---
 

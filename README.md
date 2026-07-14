@@ -280,9 +280,20 @@ python data/seed.py
 
 ```bash
 docker compose up --build
+# or run in the background:
+docker compose up --build -d
 ```
 
 Opens at **http://localhost:8501**. Stop with `docker compose down`.
+
+Quick smoke checks after startup:
+
+```bash
+docker compose ps
+docker compose logs agent
+```
+
+Expected healthy state: `app`, `agent`, `simulator`, and `memory-retry-worker` are `Up`; `seeder` has exited successfully; the dashboard responds at `http://localhost:8501`. The agent may immediately process seeded below-ROP alerts and create awaiting-approval orders before you prepare the deterministic MED-3017 scenario.
 
 Services started:
 | Service | What it does |
@@ -290,7 +301,7 @@ Services started:
 | `seeder` | Seeds MongoDB once; exits 0 on success |
 | `agent` | Runs the LangGraph pipeline; watches Change Stream |
 | `memory-retry-worker` | Polls `failed_memory_writes` every 30 s; retries up to 3× |
-| `simulator` | Writes a reorder alert every 5 s |
+| `simulator` | Drains inventory on a timer and writes reorder alerts when stock falls below ROP |
 | `app` | Streamlit dashboard on port 8501 |
 
 ### Option B — Kafka mode
@@ -387,6 +398,7 @@ Aggregation table showing how well predicted confidence (`high`/`medium`/`low`) 
 | Control | What it does |
 |---|---|
 | Circuit Breaker status / Reset | Shows failure count; reset button clears the counter and resumes LLM calls |
+| Prepare Context Scenario | Pauses the simulator and creates the deterministic `MED-3017 @ DC-Texas` demo path with live-state, memory, vector-precedent, and procedural-rule context |
 | Extract Rules | Runs `procedure_extractor.py` — scans `short_term_memory` for patterns (same supplier approved ≥5× in 30 days for same category+location) and writes candidate rules to `procedures` |
 | Compact Memory | Runs `memory_compactor.py` — deduplicates near-identical `agent_memory` entries (cosine similarity > 0.95) and summarises old entries |
 | Procedure candidate review | Expander listing `procedures` docs where `human_confirmed: False`; per-rule ✅ Confirm and 🗑 Dismiss buttons; confirmed rules are passed to the agent via `get_applicable_procedures` tool |
@@ -452,6 +464,8 @@ python3 -m pytest tests/ -v
 
 Tests that require a live MongoDB Atlas connection are automatically skipped when the cluster is unreachable (`requires_db` marker). All other tests run without any external dependencies.
 
+Current local baseline after the demo smoke test: `90 passed, 2 skipped`. Skips are expected when the full graph integration dependencies are not importable in the local Python environment; run inside the Docker image/full dependency environment to exercise those paths.
+
 ```bash
 # Only offline unit tests (no DB, no LLM)
 python3 -m pytest tests/ -v -m "not requires_db"
@@ -465,14 +479,16 @@ python3 -m pytest tests/test_coordination/ -v
 | Module | Location | What is tested |
 |---|---|---|
 | Coverage gap logic | `test_nodes/test_assess_alert.py` | Gap calculation, expedite flag, boundary conditions |
-| Auto-approve thresholds | `test_nodes/test_save_order.py` | High-confidence auto-approval, zero-gap path, cost threshold, interrupt() pause |
-| Recommend validation | `test_nodes/test_recommend.py` | Validation rules, retry logic, escalation flag |
+| Auto-approve thresholds | `test_nodes/test_save_and_notify.py` | High-confidence auto-approval, zero-gap path, cost threshold, human-review side-effect idempotency |
+| Audit validation | `test_nodes/test_audit_agent.py` | Validation rules, retry routing, escalation route |
 | Consumption trend | `test_tools/test_consumption_trend.py` | Avg daily calculation, trend direction |
 | Memory read/write | `test_tools/test_memory_read_write.py` | Short-term insert, read, TTL filtering |
+| Memory payloads | `test_tools/test_memory_payloads.py` | Human rejection fields persisted for future context |
+| Context manifest | `test_tools/test_context_manifest.py` | Context source summary and guardrail manifest shape |
 | Context budget | `test_tools/test_context_budget.py` | Token counting, trim priority order |
 | Prompt rendering | `test_prompts/test_build_prompt.py`, `test_memory_tags.py` | Tag formatting, prompt structure |
 | SKU lock | `test_coordination/test_sku_lock.py` | Acquire/release logic, expired-lock cleanup, concurrent exclusivity (real DB) |
-| End-to-end pipeline | `integration/test_full_pipeline.py` | Insert alert → graph → assert proposed_order saved (requires Docker) |
+| End-to-end pipeline | `integration/test_full_pipeline.py` | Insert alert → graph → assert proposed_order saved (requires MongoDB and graph dependencies) |
 
 ### Coordination tests in detail
 
@@ -534,13 +550,14 @@ Supply_Chain_Reorder_Agent/
 │   ├── conftest.py                  # fixtures: test_db, mock LLM, mock Voyage AI
 │   ├── test_nodes/
 │   │   ├── test_assess_alert.py     # coverage gap + expedite logic
-│   │   ├── test_save_order.py       # auto-approve thresholds, zero-gap path, interrupt() pause
-│   │   ├── test_write_memories.py   # memory writes after approval / rejection
-│   │   └── test_recommend.py        # validation rules, retry logic, escalation flag
+│   │   ├── test_save_and_notify.py  # auto-approve thresholds, zero-gap path, approval idempotency
+│   │   └── test_audit_agent.py      # validation rules, retry routing, escalation route
 │   ├── test_tools/
 │   │   ├── test_consumption_trend.py
-│   │   ├── test_memory_read_write.py
-│   │   └── test_context_budget.py
+│   │   ├── test_context_budget.py
+│   │   ├── test_context_manifest.py
+│   │   ├── test_memory_payloads.py
+│   │   └── test_memory_read_write.py
 │   ├── test_prompts/
 │   │   ├── test_build_prompt.py
 │   │   └── test_memory_tags.py
