@@ -6,7 +6,6 @@ the combined context sections stay within the token limit. Sections are trimmed
 in priority order: lowest-value sections are cut first.
 """
 
-import os
 import re
 
 # ---------------------------------------------------------------------------
@@ -74,11 +73,33 @@ def trim_to_budget(
     Returns:
         A new dict with the same keys but trimmed values where necessary.
     """
+    result, _ = trim_to_budget_with_report(sections, budget)
+    return result
+
+
+def trim_to_budget_with_report(
+    sections: dict[str, str],
+    budget: int = TOKEN_BUDGET_TOTAL,
+) -> tuple[dict[str, str], dict]:
+    """Trim context sections and return a report suitable for UI display."""
     result = dict(sections)
-    total  = sum(count_tokens(v) for v in result.values())
+    before = {k: count_tokens(v) for k, v in result.items()}
+    total  = sum(before.values())
+    report = {
+        "budget": budget,
+        "warning_threshold": TOKEN_BUDGET_WARNING,
+        "total_before": total,
+        "total_after": total,
+        "trimmed": False,
+        "sections": {
+            k: {"before": v, "after": v, "trimmed": False}
+            for k, v in before.items()
+        },
+        "trim_order": list(_TRIM_ORDER),
+    }
 
     if total <= budget:
-        return result
+        return result, report
 
     if total > TOKEN_BUDGET_WARNING:
         print(
@@ -124,10 +145,20 @@ def trim_to_budget(
             result[key] = _truncate_lines(text, 2)
             total = total - tokens + count_tokens(result[key])
 
+        after_tokens = count_tokens(result[key])
+        if after_tokens != tokens:
+            report["trimmed"] = True
+            report["sections"][key] = {
+                "before": tokens,
+                "after": after_tokens,
+                "trimmed": True,
+            }
+
     if total > budget:
         print(
             f"  [context_budget] Could not reduce to budget "
             f"({total} > {budget} tokens) — proceeding anyway"
         )
 
-    return result
+    report["total_after"] = total
+    return result, report

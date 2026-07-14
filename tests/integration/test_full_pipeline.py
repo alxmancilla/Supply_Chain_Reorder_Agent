@@ -10,11 +10,13 @@ when the package is absent (e.g., local dev without the full Docker deps).
 
 import asyncio
 import json
+import os
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from bson import ObjectId
+from motor.motor_asyncio import AsyncIOMotorClient
 from tests.conftest import requires_db
 
 pytestmark = requires_db
@@ -64,10 +66,23 @@ RECOMMENDATION_JSON = json.dumps({
 
 def _pick_response(messages):
     for m in messages:
-        content = m.get("content", "") if isinstance(m, dict) else getattr(m, "content", "")
-        if "ANALYSIS" in str(content).upper():
-            return _fake_llm_response(ANALYSIS_JSON)
+        if isinstance(m, dict) and m.get("role") == "system":
+            content = str(m.get("content", ""))
+            if "RISK ANALYST" in content.upper() or "ANALYSIS" in content.upper():
+                return _fake_llm_response(ANALYSIS_JSON)
+            if "PROCUREMENT SPECIALIST" in content.upper() or "RECOMMENDATION" in content.upper():
+                return _fake_llm_response(RECOMMENDATION_JSON)
     return _fake_llm_response(RECOMMENDATION_JSON)
+
+
+def _async_db_for(sync_db):
+    client = AsyncIOMotorClient(
+        os.environ["MONGODB_URI"],
+        serverSelectionTimeoutMS=5_000,
+        connectTimeoutMS=10_000,
+        socketTimeoutMS=30_000,
+    )
+    return client[sync_db.name], client
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +107,7 @@ class TestFullPipeline:
         alert_serialized = _sd(self.alert_doc)
 
         async def _run():
+            async_db, async_client = _async_db_for(self.db)
             fake_llm = AsyncMock()
             fake_llm.ainvoke.side_effect = _pick_response
 
@@ -105,7 +121,7 @@ class TestFullPipeline:
                  patch("agent.graph.llm", fake_llm), \
                  patch("agent.graph._retrieval_react_agent") as mock_react, \
                  patch("agent.graph._db_sync", self.db), \
-                 patch("agent.graph._db_async", self.db), \
+                 patch("agent.graph._db_async", async_db), \
                  patch("agent.tools._db", self.db), \
                  patch("agent.tools._voyage") as mock_voyage, \
                  patch("agent.tools._get_embedding", return_value=zero_embed):
@@ -114,9 +130,12 @@ class TestFullPipeline:
                 mock_voyage.embed.return_value = MagicMock(embeddings=[zero_embed])
 
                 config = {"configurable": {"thread_id": str(self.alert_doc["_id"])}}
-                await _graph.ainvoke({"alert": alert_serialized}, config=config)
+                try:
+                    await _graph.ainvoke({"alert": alert_serialized}, config=config)
+                finally:
+                    async_client.close()
 
-        asyncio.get_event_loop().run_until_complete(_run())
+        asyncio.run(_run())
 
         order = self.db.proposed_orders.find_one({
             "sku":      self.alert_doc["sku"],
@@ -139,6 +158,7 @@ class TestFullPipeline:
         llm_call_count   = 0
 
         async def _run():
+            async_db, async_client = _async_db_for(self.db)
             fake_llm = AsyncMock()
             async def counting_invoke(messages, **kw):
                 nonlocal llm_call_count
@@ -151,15 +171,18 @@ class TestFullPipeline:
                  patch("agent.graph.llm", fake_llm), \
                  patch("agent.graph._retrieval_react_agent") as mock_react, \
                  patch("agent.graph._db_sync", self.db), \
-                 patch("agent.graph._db_async", self.db), \
+                 patch("agent.graph._db_async", async_db), \
                  patch("agent.tools._db", self.db), \
                  patch("agent.tools._get_embedding", return_value=[0.0] * 1024):
 
                 mock_react.ainvoke = AsyncMock(return_value={"messages": []})
                 config = {"configurable": {"thread_id": f"zero-gap-{self.alert_doc['_id']}"}}
-                await _graph.ainvoke({"alert": alert_serialized}, config=config)
+                try:
+                    await _graph.ainvoke({"alert": alert_serialized}, config=config)
+                finally:
+                    async_client.close()
 
-        asyncio.get_event_loop().run_until_complete(_run())
+        asyncio.run(_run())
 
         assert llm_call_count == 0, "LLM should not be invoked when coverage_gap is 0"
 

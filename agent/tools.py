@@ -395,6 +395,7 @@ def _record_failed_memory_write(
 def write_short_term_memory_sync(
     sku: str, location: str, recommendation: dict,
     days_remaining: float, auto_approved: bool,
+    decided_by: str = "agent", human_decision: str | None = None,
 ) -> None:
     """Persist a decision summary to short_term_memory (TTL=24 h)."""
     payload = {
@@ -407,6 +408,8 @@ def write_short_term_memory_sync(
         "confidence":               recommendation.get("confidence"),
         "days_of_stock_at_decision": days_remaining,
         "auto_approved":            auto_approved,
+        "decided_by":               decided_by,
+        "human_decision":           human_decision,
         "rationale_summary":        recommendation.get("rationale", "")[:300],
     }
     try:
@@ -506,6 +509,7 @@ def write_order_history_sync(
 def write_long_term_memory_sync(
     sku: str, item_name: str, location: str, recommendation: dict,
     days_remaining: float, trend: str, auto_approved: bool,
+    decided_by: str = "agent", human_decision: str | None = None,
 ) -> None:
     """
     Generate a natural-language summary of this decision, embed it with
@@ -516,11 +520,16 @@ def write_long_term_memory_sync(
     supplier   = recommendation.get("supplier_name", "")
     rationale  = recommendation.get("rationale", "")[:400]
 
+    if decided_by == "human":
+        action = "Human APPROVED" if human_decision == "approved" else "Human REJECTED"
+        outcome_text = f"{action} this recommendation."
+    else:
+        outcome_text = "Auto-approved." if auto_approved else "Sent for manual approval."
+
     content = (
         f"{sku} ({item_name}) at {location}: {days_remaining} days of stock remaining, "
         f"{trend} consumption trend. Ordered {quantity} units from {supplier} "
-        f"(confidence: {confidence}). {rationale} "
-        f"{'Auto-approved.' if auto_approved else 'Sent for manual approval.'}"
+        f"(confidence: {confidence}). {rationale} {outcome_text}"
     )
     payload = {
         "sku":           sku,
@@ -528,6 +537,8 @@ def write_long_term_memory_sync(
         "content":       content,
         "confidence":    confidence,
         "auto_approved": auto_approved,
+        "decided_by":    decided_by,
+        "human_decision": human_decision,
         "created_at":    datetime.now(timezone.utc).isoformat(),
     }
     try:
@@ -796,11 +807,16 @@ def validate_recommendation(rec: dict, state: dict) -> list:
     # Regulatory: pharmaceutical and laboratory SKUs must use an FDA-registered supplier.
     _FDA_REQUIRED = {"pharmaceutical", "laboratory"}
     category = state.get("inventory", {}).get("category", "")
-    if category in _FDA_REQUIRED and not zero_gap:
+    if not zero_gap:
         chosen_id = rec.get("supplier_id")
         suppliers  = state.get("suppliers", [])
         chosen_sup = next((s for s in suppliers if s.get("supplier_id") == chosen_id), None)
-        if chosen_sup is not None and not chosen_sup.get("fda_registered", True):
+        if chosen_sup is None:
+            errors.append(
+                f"Unknown supplier_id '{chosen_id}'. Choose one of the approved suppliers returned "
+                "by get_supplier_options for this SKU."
+            )
+        elif category in _FDA_REQUIRED and not chosen_sup.get("fda_registered", True):
             errors.append(
                 f"Regulatory violation: '{chosen_sup.get('supplier_name', chosen_id)}' is not "
                 f"FDA-registered. {category.capitalize()} SKUs require an FDA-licensed wholesale "

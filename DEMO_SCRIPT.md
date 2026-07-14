@@ -5,252 +5,197 @@
 
 ## 0 · Before you start (setup, not spoken)
 
-- Click **🔄 Reset Demo** in the sidebar to clear any state from a previous run — inventory and suppliers are preserved, operational collections are wiped
-- `docker compose up --build` is running (Python 3.12 image); seeder has completed
-- Browser open at **http://localhost:8501**
-- Simulator is **running** (▶ Start pressed in sidebar — Status shows 🟢 Running)
-- Drain Speed slider is at **1× Normal** for a measured start
-- Confirm the agent is active: within ~30 seconds of starting you should see proposed orders appearing in the right column — if not, check `docker compose logs agent`
-- **Optional — Explain Mode:** run the agent with `EXPLAIN_MODE=1` to print plain-English node descriptions alongside the JSON logs. Useful if your audience wants to see the pipeline narrated in real time without reading structured log output: `EXPLAIN_MODE=1 python agent/graph.py`
-- Atlas UI open in a second tab (optional — useful for showing the Search / Vector Search indexes if the audience asks)
-- **Watch for these SKUs** — they have a seeded rising demand trend and will produce MEDIUM confidence even with stock above 5 days:
-  - `MED-3017` (Insulin Glargine · DC-Texas · pharmaceutical)
-  - `SURG-0084` (Nitrile Gloves · DC-Ohio · surgical)
-  - `DIAG-0331` (COVID/Flu Test Kit · DC-Ohio · diagnostic)
-- **Pharmaceutical SKUs** (`MED-*` and `LAB-0112`) trigger FDA regulatory enforcement — the agent will reject any supplier not marked `fda_registered: true`
+- `docker compose up --build` is running; seeder has completed.
+- Browser open at **http://localhost:8501**.
+- Click **🔄 Reset Demo** if you need a clean baseline.
+- Open **Admin Panel → 🎯 Prepare Context Scenario**. This pauses the simulator and creates a deterministic `MED-3017 @ DC-Texas` alert with:
+  - live inventory below reorder point
+  - rising demand trend from seeded time-series data
+  - similar historical insulin orders for Vector Search
+  - a recent `⚠ HUMAN REJECTED` short-term memory
+  - a confirmed procedural rule preferring BioPharm Global
+- Confirm the new alert appears in **Active Alerts**.
+- Optional: keep Atlas UI open to show `reorder_alerts`, `proposed_orders`, `checkpoints`, `short_term_memory`, and `order_history`.
+- Optional: run the agent with `EXPLAIN_MODE=1` if you want narrated node logs.
 
 ---
 
 ## 1 · Set the scene `[0:00 – 0:30]`
 
-> "Healthcare supply chains have zero tolerance for stockouts — a missing medication
-> can be a patient safety event. But most reorder decisions are still manual:
-> someone checks a spreadsheet, picks a supplier, estimates a quantity, and routes
-> it for approval. Across hundreds of SKUs and multiple distribution centres,
-> done manually under time pressure, things get missed.
-> This demo automates that entire loop — an AI agent that responds in seconds,
-> not hours, using MongoDB Atlas as the backbone."
+> "The demo is not just an LLM writing a purchase order. The important part is
+> context engineering: deciding what operational facts, memories, policies, and
+> historical precedents the model should see before it makes a recommendation."
 
-**👉 Point broadly at the dashboard.**
+**Point broadly at the dashboard.**
 
-> "Two live columns: inventory grid on the left — critical items sort to the top
-> automatically. Alerts and agent decisions stacked on the right.
-> Seven KPI cards across the top: stock below reorder point, active alerts,
-> orders awaiting approval, ROP health, auto-approved count, deliveries, and escalations.
-> The dashboard polls every 10 seconds; the agent reacts the moment an alert lands."
+> "Healthcare inventory decisions are high stakes. A reorder agent needs live stock,
+> active orders, supplier constraints, demand trend, past outcomes, human feedback,
+> and compliance rules. MongoDB is acting as the context substrate for all of that."
 
 ---
 
-## 2 · Watch an alert arrive `[0:30 – 1:30]`
+## 2 · Alert arrives: live operational context `[0:30 – 1:10]`
 
-**👉 Point at the left column — find a red 🔴 CRITICAL card near the top.**
+**Point at the `MED-3017 @ DC-Texas` alert in Active Alerts.**
 
-> "Critical items sort to the top automatically. The progress bar shows how far
-> below the reorder point we are. Each card shows On Hand, On Order, Reorder Point,
-> Effective stock — and that small indicator at the bottom is the ROP health check,
-> which I'll come back to."
+> "This alert is a live MongoDB document. The agent watches `reorder_alerts` with a
+> Change Stream. When a pending alert appears, the graph claims it atomically and
+> computes the real coverage gap from current inventory plus active orders."
 
-**👉 Point at the Active Alerts section when a new alert card appears.**
+**Point at the inventory card.**
 
-> "The simulator drains stock every few seconds, mimicking what Atlas Stream
-> Processing would do in production off a Kafka feed. The moment on-hand drops
-> below the reorder point, an alert document is inserted into MongoDB.
-> The agent watches that collection via a Change Stream — not a cron job, not polling —
-> so it triggers the instant the write lands."
+> "The first context layer is live state: on hand, reorder point, active orders,
+> days of stock, and ROP health. This prevents the model from ordering against
+> stale dashboard data or duplicating an in-flight order."
 
-> "Notice the urgency badge: CRITICAL means less than 2 days of stock.
-> The time-ago label tells us exactly when this fired."
-
-*Contingency: if no new alert appears within 20 seconds, move the Drain Speed slider to 3× to accelerate consumption — alerts will fire within seconds.*
-
-**👉 Move the ⚡ Drain Speed slider to 10× Chaos.**
-
-> "Now watch what happens under load."
-
-*(pause 10–15 seconds while alerts fire across all SKUs)*
-
-> "Ten times the normal drain rate — alerts firing across every SKU simultaneously.
-> The agent processes them concurrently. Each one runs the full pipeline independently,
-> with a distributed MongoDB lock preventing two workers from writing a duplicate order
-> for the same SKU. Slide it back to 1× once you've made the point."
-
-**👉 Return slider to 1× Normal. Point at the `PROCESSING…` badge on an alert card.**
-
-> "The agent is already working on these. Let's look at what it produces."
+> "The SKU-level lock makes this safe to run with multiple workers. In the default
+> demo stack we use one agent worker for clarity, but the lock prevents duplicate
+> orders if you scale workers out."
 
 ---
 
-## 3 · Show the agent decision `[1:30 – 3:00]`
+## 3 · Open the Context Packet `[1:10 – 2:30]`
 
-**👉 Wait for an order card to appear in the Agent Decisions section, then walk through it.**
+**Open the latest order card → `💬 Rationale / 📦 Context Packet`.**
 
-*Contingency: LLM calls can take 20–40 seconds. If nothing appears, keep talking through the pipeline description — the order will arrive before you finish. If it takes longer than 60 seconds, point at a completed order from an earlier alert and use that.*
+> "This is the center of the demo. The agent persisted a context manifest with the
+> order, so we can inspect what context was used, why it was included, and how it
+> was budgeted before the final recommendation was written."
 
-> "The agent ran a multi-agent LangGraph pipeline — four specialist agents,
-> each with a scoped responsibility.
-> A ReAct retrieval agent decides which MongoDB queries to run: supplier list,
-> consumption trend, Atlas Search, Vector Search — and only fetches what it needs.
-> An analysis agent evaluates the options and assigns a confidence level.
-> A recommendation agent calculates the quantity and writes a plain-English rationale.
-> An audit agent validates the output against schema and business rules before
-> anything is persisted. If validation fails, the pipeline retries automatically —
-> up to twice — before escalating to the human queue."
+**Point at the three metrics.**
 
-**👉 Point at the confidence and status badges.**
+> "Coverage gap tells us the precise quantity problem. Tools Called shows which
+> retrieval tools were actually used. Context Tokens shows the final context size
+> after budget management."
 
-> "Confidence gates the auto-approve decision. HIGH requires all four conditions
-> simultaneously: at least 5 days of stock, stable or decreasing trend, a supplier
-> with 95%+ fill rate, and at least 14 days of consumption history on record.
-> Any single red flag — rising trend, thin history, weak supplier — drops it to
-> MEDIUM or LOW."
->
-> "If confidence is HIGH and the total cost is under $5,000, the order is approved
-> instantly — you'll see the ⚡ AUTO badge.
-> Orders at or above $5,000 are always held for human review regardless of confidence.
-> The card shows a ⚠ REVIEW badge with the specific reason."
+**Point at 'What context was included and why'.**
 
-**👉 If the alert is for MED-3017, SURG-0084, or DIAG-0331 — call this out.**
+> "The context packet is deliberately structured into categories: live state,
+> retrieved context, memory, policy rules, and validation. This is the difference
+> between a generic chatbot and an operational agent."
 
-> "This one shows MEDIUM confidence despite having more than 5 days of stock.
-> That's because consumption has been climbing steadily over the last 30 days —
-> the trend is a genuine gate. An order sized for today's demand may already be
-> too small by the time it delivers."
+Call out these rows if present:
 
-**👉 If the alert is for a pharmaceutical SKU (MED-* or LAB-0112) — add this.**
+- **Inventory position**: grounds the recommendation in live stock.
+- **Active order coverage**: prevents duplicate purchasing.
+- **Approved suppliers**: constrains the model to real supplier IDs, MOQ, cost, and lead time.
+- **Consumption trend**: `MED-3017` has rising demand, so confidence should drop.
+- **Vector-similar past orders**: similar insulin reorder precedents from `order_history`.
+- **Short-term memory**: recent `⚠ HUMAN REJECTED` signal.
+- **Procedural rules**: confirmed preference for BioPharm Global.
+- **Episode history**: prior alert lifecycle outcomes when available.
 
-> "Notice which supplier was chosen. The agent is legally prevented from selecting
-> a non-FDA-registered wholesale distributor for pharmaceutical SKUs —
-> that's a hard constraint in the audit agent, not a soft preference.
-> If it had picked the cheaper option, the audit step would have rejected it
-> and forced a retry with a different supplier."
+**Point at Retrieval trace.**
 
-**👉 Expand `💬 Rationale / 🧠 Vector Search`.**
+> "The retrieval trace is the agent's context acquisition path. The ReAct stage
+> decides which MongoDB-backed tools to call: supplier options, time-series trend,
+> Atlas Search, Vector Search, recent decisions, long-term memory, procedures, and
+> episode history."
 
-> "Plain-English rationale — ready for a non-technical approver to read.
-> Stock level, trend, supplier fill rate, cost, all in one paragraph."
+**Point at Token budget trimming.**
 
-> "Below that are the Vector Search results. The agent embedded the current
-> situation with Voyage AI and retrieved the most semantically similar historical
-> orders from the same product category — using Atlas Vector Search pre-filtering
-> so cross-category noise is eliminated before ANN scoring.
-> Similarity scores above 0.78. These past outcomes feed directly into the
-> LLM prompt as precedent, so the agent learns from what worked before."
+> "As memory grows, context cannot grow forever. The budget manager trims low-value
+> context first: debug traces, lower-score long-term memories, lower-similarity
+> past orders, then less critical sections. High-value facts like coverage gap and
+> supplier constraints are kept as long as possible."
 
 ---
 
-## 4 · Show memory growing + reject / escalation flow `[3:00 – 4:00]`
+## 4 · Recommendation and guardrails `[2:30 – 3:10]`
 
-**👉 Point at the sidebar Demo Status panel.**
+**Point at confidence, status, supplier, quantity, and rationale.**
 
-> "Long-term Memories count starts low but grows with every decision.
-> After each order the agent writes a natural-language summary, embeds it,
-> and stores it in `agent_memory`. From the next alert for this SKU onwards,
-> the agent retrieves its own past learnings via Vector Search and factors them
-> into the recommendation — supplier preferences, quantity adjustments, what a
-> human approved or rejected."
+> "The model does not decide in isolation. The analysis stage evaluates supplier
+> reliability, lead time, compliance, trend, and memory. The recommendation stage
+> calculates quantity from coverage gap and MOQ, then writes plain-English rationale."
 
-**👉 Find a `MEDIUM` confidence order with the AWAITING badge and click ❌ Reject.**
+**Point at Validation guardrails in the Context Packet.**
 
-> "Watch what happens when I click Reject. This isn't a simple MongoDB write.
-> The graph actually paused at a node called `save_order` — LangGraph serialised
-> the entire agent state to the `checkpoints` collection via MongoDBSaver and waited.
-> When I click Reject, the dashboard calls `graph.invoke(Command(resume={'approved': False}))`.
-> LangGraph reloads that checkpoint from MongoDB, re-enters the node right where it
-> stopped, and runs the rejection logic — updating the order, the alert, the memory —
-> all inside the graph."
->
-> "Open the `checkpoints` collection in Atlas while an order is awaiting review.
-> You'll see the complete agent state — suppliers, retrieval trace, recommendation,
-> memories — frozen in one document. That's the entire LangGraph + MongoDB story
-> in a single Atlas query."
->
-> "After the rejection: the alert resets to pending, the Change Stream fires again,
-> and the agent reprocesses with a ⚠ HUMAN REJECTED tag visible in short-term memory.
-> The prompt requires the agent to change its approach — different supplier,
-> adjusted quantity — and explain what changed in the rationale."
->
-> "The rejection is also written to long-term memory as an embedded document.
-> Human oversight becomes a persistent training signal, not just a one-time gate."
+> "After generation, validation checks the output. It rejects malformed JSON,
+> unknown supplier IDs, non-FDA suppliers for pharmaceutical SKUs, invalid zero-gap
+> quantities, and anything that violates the approval policy. Context engineering
+> includes retrieval, prompt structure, and post-generation verification."
 
-*Contingency: if the reprocessed order takes more than 30 seconds, point at the Demo Status panel and watch the Long-term Memories counter increment — that's the memory write completing in the background.*
+**If the order is awaiting approval:**
 
-**👉 Watch the new order appear and point at the rationale.**
-
-> "The rationale now explicitly acknowledges the prior rejection and explains
-> what changed. The supplier choice or quantity will be different."
-
-**👉 Mention the escalation safety net briefly.**
-
-> "There's a safety net. If the same alert is rejected three times, the agent
-> stops retrying and escalates — writes to an escalation queue, marks the alert
-> 'escalated', and optionally fires a webhook. Those alerts surface in a dedicated
-> section on the dashboard. Nothing falls through the cracks."
-
-**👉 Click ✅ Approve on any order.**
-
-> "Approvals are recorded the same way — ✓ HUMAN APPROVED in short-term memory
-> and an embedded entry in long-term memory. That supplier gets a preference signal
-> for future alerts on this SKU."
+> "This order is held because confidence or budget policy requires a human. The
+> graph pauses with LangGraph `interrupt()` and stores the checkpoint in MongoDB."
 
 ---
 
-## 5 · MongoDB Atlas features — rapid fire `[4:00 – 4:45]`
+## 5 · Human feedback changes future context `[3:10 – 4:00]`
 
-**👉 Scroll down to Supplier Search in the sidebar, type `cold chain insulin`, press Search.**
+**Click ❌ Reject on the awaiting order.**
 
-> "The search uses two independent pipelines — one finds exact supplier name matches,
-> one finds fuzzy keyword matches in capability notes — then combines their rankings
-> using Reciprocal Rank Fusion. Think of it as asking two experts to independently
-> shortlist suppliers and then intelligently merging their lists. The source label
-> shows 🔀 $rankFusion. If the Atlas Search index isn't available it falls back
-> to a plain regex search automatically."
+> "A rejection is not just a status update. The graph resumes from checkpoint,
+> marks the order rejected, writes short-term and long-term memory, then requeues
+> the alert. The next run sees a different context packet."
 
-**👉 Point at an inventory card's ✅ / ⚠️ / 🔴 indicator at the bottom.**
+**Wait for the next order and reopen `💬 Rationale / 📦 Context Packet`.**
 
-> "Each inventory card has a ROP health check. Green means the reorder point fires
-> with enough runway for the supplier to deliver. Amber means safety stock barely
-> bridges the gap. Red means the reorder point is set too low — by the time the
-> alert fires, the supplier can't deliver before stock hits zero.
-> The 📐 ROP Health KPI card at the top counts how many SKUs are currently at risk."
+> "Now the short-term memory row contains the human rejection. The prompt renders
+> it as `⚠ HUMAN REJECTED`, and the recommendation is required to change approach
+> or explain why it cannot."
 
-**👉 Open Admin Panel → 🔁 Agent Recovery Log.**
+**Point at rationale.**
 
-> "LangGraph checkpoints every node transition to MongoDB via MongoDBSaver.
-> That's the same collection that stores the pause-point when `interrupt()` fires —
-> one collection, two jobs: crash recovery and human-in-the-loop state.
-> If the agent process crashes mid-pipeline, the next invocation resumes from
-> the last checkpoint rather than starting from scratch.
-> This panel reads those checkpoints directly and shows each pipeline run:
-> SKU, last node executed, step count, and outcome — completed, re-queued,
-> escalated, or recovered mid-pipeline. Crash recovery and human review,
-> both made visible through the same MongoDB collection."
+> "This is the key context-engineering loop: human feedback becomes context, not
+> just an audit log. The next recommendation is conditioned on what the human just
+> taught the agent."
+
+**Click ✅ Approve on the revised order if available.**
+
+> "Approval is written the same way: short-term memory for immediate reuse and
+> long-term semantic memory for future vector retrieval."
 
 ---
 
-## 6 · Close `[4:45 – 5:00]`
+## 6 · MongoDB Atlas features through the context lens `[4:00 – 4:45]`
 
-> "Everything you just saw — semantic retrieval, regulatory enforcement,
-> crash recovery, real-time event streaming — runs on a single MongoDB Atlas cluster.
-> No separate vector database. No external search service. No dedicated streaming
-> platform. The same store that holds your inventory data also carries the agent's
-> memory, the compliance checks, and the full audit trail.
-> In production the simulator is replaced by an Atlas Stream Processing pipeline
-> off Kafka — the agent code doesn't change, it only sees the `reorder_alerts`
-> collection. That's the architectural bet: when AI is core to your operations,
-> your data platform has to carry it natively."
+**Supplier Search: type `cold chain insulin`.**
+
+> "Atlas Search is used for supplier capability retrieval. The app combines supplier
+> name matching and capability-note matching with `$rankFusion`, then falls back
+> gracefully if Search is unavailable."
+
+**Point back to the Context Packet.**
+
+> "Vector Search supplies historical precedents. Time Series supplies trend.
+> TTL memory supplies fresh human feedback. Checkpoints freeze the graph state.
+> Documents hold the final order and its context manifest. These are all context
+> engineering primitives, not separate demo tricks."
+
+**Open Admin Panel → Agent Recovery Log.**
+
+> "The same checkpoint store supports human-in-the-loop pause and crash recovery.
+> If the agent crashes after claiming an alert, startup recovery requeues stale
+> `processing` alerts. If it crashes around approval, inventory side effects are
+> idempotent so stock is not double-counted."
+
+---
+
+## 7 · Close `[4:45 – 5:00]`
+
+> "The takeaway: production agents are only as good as their context pipeline.
+> This demo engineers the context packet, validates the output, persists the
+> decision, and turns human feedback into future context. MongoDB Atlas is the
+> operational substrate for live state, search, vector retrieval, memory,
+> checkpoints, and auditability."
 
 ---
 
 ## Quick-reference timings
 
-| Segment | Time | Key talking points |
-|---|---|---|
-| Set the scene | 0:00 – 0:30 | Pain point (manual reorder = risk), two-column layout, 7 KPI cards, Change Stream vs auto-refresh distinction |
-| Alert arrives + Chaos Mode | 0:30 – 1:30 | Change Stream trigger, urgency badge, 10× Chaos to show concurrent load, distributed SKU lock |
-| Agent decision + rationale | 1:30 – 3:00 | Four-agent pipeline, 4-criteria confidence, $5,000 ceiling, ⚠ REVIEW badge, rising-trend SKUs, FDA enforcement (if pharma SKU), Vector Search precedent |
-| Memory + reject / escalation | 3:00 – 4:00 | Human decisions in both memory layers, ⚠ REJECTED tag forces change, 3-rejection escalation safety net |
-| Atlas features rapid-fire | 4:00 – 4:45 | $rankFusion "two experts" analogy, ROP health indicator, Agent Recovery Log (checkpoint recovery) |
-| Close | 4:45 – 5:00 | No separate infrastructure — one cluster for storage, search, vector, streaming, agent state |
+| Segment | Time | Key point |
+|---|---:|---|
+| Setup | before | Use 🎯 Prepare Context Scenario for deterministic MED-3017 flow |
+| Set scene | 0:00–0:30 | Context engineering, not just PO generation |
+| Alert/live state | 0:30–1:10 | Change Stream, coverage gap, active orders, SKU lock |
+| Context Packet | 1:10–2:30 | Sources, retrieval trace, token budget, why included |
+| Recommendation | 2:30–3:10 | Staged reasoning, validation guardrails, HITL |
+| Human feedback | 3:10–4:00 | Reject → memory → changed context → revised recommendation |
+| Atlas features | 4:00–4:45 | Search, Vector Search, Time Series, TTL, checkpoints |
+| Close | 4:45–5:00 | MongoDB as context substrate |
 
 ---
 
@@ -258,21 +203,23 @@
 
 | Situation | Response |
 |---|---|
-| No new alert appears | Bump Drain Speed to 3× — alerts fire within seconds; return to 1× after |
-| Agent decision takes > 45 s | Continue talking through the pipeline description; point at a completed order from an earlier alert |
-| Reprocessed order after reject takes > 30 s | Point at Long-term Memories counter in Demo Status — watch it increment; mention `write_memories` node running in background |
-| Atlas Search / $rankFusion error | The UI falls back to regex automatically; mention "graceful degradation" as a feature |
-| Agent Recovery Log is empty | Demo was just reset; process one alert first, then reopen the expander |
+| No order appears | Confirm agent container is running: `docker compose logs agent`; the prepared alert should process without waiting for simulator drain. |
+| Context Packet is missing | Use a newly generated order; older orders created before this feature do not have `context_manifest`. |
+| Vector Search has no hits | Mention graceful degradation; the Context Packet still shows supplier, trend, memory, and validation context. |
+| Reprocessed order takes time | Explain that the graph writes memory before requeueing so the next run sees the rejection. |
+| Agent Recovery Log is empty | Process one alert first; checkpoints appear after graph execution. |
+| Too many old cards | Click Reset Demo, then Prepare Context Scenario again. |
 
 ---
 
 ## Sidebar controls — quick reference
 
-| Control | Location | What it does |
-|---|---|---|
-| ▶ / ⏸ / ⏹ | Simulator Controls | Start / pause / stop inventory drain |
-| ⚡ Drain Speed | Below start/stop buttons | 1× Normal → 10× Chaos; multiplies units consumed per tick |
-| 🔍 Supplier Search | Mid-sidebar | $rankFusion hybrid search (name + capability) with regex fallback |
-| 📊 Demo Status | Lower sidebar | Live counts: alerts, decisions, auto-approved %, escalations, failed memory writes, long-term memories |
-| 🔄 Reset Demo | Bottom of sidebar | Clears operational data; resets speed to 1×; clears resume token — run this before every demo |
-| 🛠 Admin Panel | Below Reset Demo (admin only) | Circuit breaker reset, Extract Rules, Compact Memory, Procedure candidate review (✅/🗑), Agent Recovery Log (🔁) |
+| Control | What it does |
+|---|---|
+| ▶ / ⏸ / ⏹ | Start, pause, or stop simulator-driven inventory drain |
+| ⚡ Drain Speed | Multiplies simulated consumption rate |
+| 🔍 Supplier Search | Demonstrates Atlas Search / `$rankFusion` supplier capability retrieval |
+| 📊 Demo Status | Shows alert, decision, auto-approval, escalation, failure, and memory counts |
+| 🔄 Reset Demo | Clears operational data and checkpoint state |
+| 🎯 Prepare Context Scenario | Creates deterministic MED-3017 context-engineering demo path |
+| 🛠 Admin Panel | Circuit reset, procedure extraction, memory compaction, recovery log |

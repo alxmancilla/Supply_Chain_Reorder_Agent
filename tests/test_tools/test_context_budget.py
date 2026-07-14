@@ -2,7 +2,12 @@
 
 import pytest
 
-from agent.context_budget import TOKEN_BUDGET_TOTAL, count_tokens, trim_to_budget
+from agent.context_budget import (
+    TOKEN_BUDGET_TOTAL,
+    count_tokens,
+    trim_to_budget,
+    trim_to_budget_with_report,
+)
 
 
 def test_count_tokens_non_empty():
@@ -61,3 +66,15 @@ def test_trim_long_term_lines_drops_from_bottom():
     remaining = result["long_term_lines"]
     # Should either be trimmed or "(trimmed)" placeholder
     assert len(remaining) <= len(lines) or "trimmed" in remaining
+
+
+def test_trim_report_marks_trimmed_sections():
+    sections = {
+        "retrieval_trace": "trace data " * 500,
+        "supplier_lines": "supplier A\nsupplier B",
+    }
+    result, report = trim_to_budget_with_report(sections, budget=30)
+    assert result["retrieval_trace"] == ""
+    assert report["trimmed"] is True
+    assert report["sections"]["retrieval_trace"]["trimmed"] is True
+    assert report["total_before"] >= report["total_after"]

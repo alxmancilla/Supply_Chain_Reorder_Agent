@@ -72,6 +72,16 @@ def _compute_order(state: dict) -> dict:
     }
 
 
+def _approval_side_effects(current_order_status: str, inventory_applied: bool = False) -> dict:
+    """Pure replica of idempotent human approval side-effect gating."""
+    transitioned = current_order_status in ("awaiting_approval", "approved") and not inventory_applied
+    return {
+        "order_status": "approved" if transitioned or current_order_status == "approved" else current_order_status,
+        "increment_inventory": transitioned,
+        "append_lifecycle": transitioned,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -193,3 +203,23 @@ class TestOrderStatus:
     def test_awaiting_approval_status_string(self):
         order = _compute_order(_state(confidence="medium", quantity=50, unit_price=1.0))
         assert order["status"] == "awaiting_approval"
+
+
+class TestHumanApprovalIdempotency:
+    def test_first_approval_increments_inventory(self):
+        result = _approval_side_effects("awaiting_approval")
+        assert result["order_status"] == "approved"
+        assert result["increment_inventory"] is True
+        assert result["append_lifecycle"] is True
+
+    def test_duplicate_approval_does_not_increment_inventory(self):
+        result = _approval_side_effects("approved", inventory_applied=True)
+        assert result["order_status"] == "approved"
+        assert result["increment_inventory"] is False
+        assert result["append_lifecycle"] is False
+
+    def test_recovered_approved_order_without_marker_increments_inventory(self):
+        result = _approval_side_effects("approved", inventory_applied=False)
+        assert result["order_status"] == "approved"
+        assert result["increment_inventory"] is True
+        assert result["append_lifecycle"] is True

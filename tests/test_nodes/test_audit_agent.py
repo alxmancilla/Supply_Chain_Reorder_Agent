@@ -10,7 +10,12 @@ from agent.tools import validate_recommendation
 
 class TestValidateRecommendation:
     def _state(self, gap=155):
-        return {"coverage_gap": gap}
+        return {
+            "coverage_gap": gap,
+            "suppliers": [
+                {"supplier_id": "SUP-001", "supplier_name": "MedSupply Co", "fda_registered": True},
+            ],
+        }
 
     def test_valid_recommendation_returns_no_errors(self):
         rec = {
@@ -87,6 +92,17 @@ class TestValidateRecommendation:
         }
         errors = validate_recommendation(rec, self._state())
         assert any("quantity" in e for e in errors)
+
+    def test_unknown_supplier_returns_error(self):
+        rec = {
+            "supplier_id":   "SUP-999",
+            "supplier_name": "Hallucinated Supplier",
+            "quantity":      100,
+            "rationale":     "This supplier was not returned by the approved supplier tool.",
+            "confidence":    "high",
+        }
+        errors = validate_recommendation(rec, self._state())
+        assert any("Unknown supplier_id" in e for e in errors)
 
 
 def _route_after_audit(state: dict) -> str:

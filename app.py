@@ -650,15 +650,105 @@ with st.sidebar:
 
         # Circuit breaker reset
         import agent.graph as _agent_graph
-        cb_open = _agent_graph._circuit_failures >= _agent_graph._CIRCUIT_THRESHOLD
+        cb_failures = _agent_graph._get_circuit_failures()
+        cb_open = cb_failures >= _agent_graph._CIRCUIT_THRESHOLD
         if cb_open:
-            st.warning(f"⚡ Circuit breaker OPEN ({_agent_graph._circuit_failures} failures)")
+            st.warning(f"⚡ Circuit breaker OPEN ({cb_failures} failures)")
             if st.button("🔌 Reset Circuit Breaker", use_container_width=True):
-                _agent_graph._circuit_failures = 0
+                _agent_graph.reset_circuit_breaker()
                 st.success("Circuit breaker reset — LLM calls resumed.")
                 st.rerun()
         else:
-            st.caption(f"Circuit breaker: 🟢 Closed ({_agent_graph._circuit_failures}/{_agent_graph._CIRCUIT_THRESHOLD} failures)")
+            st.caption(f"Circuit breaker: 🟢 Closed ({cb_failures}/{_agent_graph._CIRCUIT_THRESHOLD} failures)")
+
+        # Deterministic context-engineering demo setup
+        st.caption("Prepare a deterministic MED-3017 scenario with live state, memory, vector precedent, and policy context.")
+        if st.button("🎯 Prepare Context Scenario", use_container_width=True):
+            now = datetime.now(timezone.utc)
+            sku = "MED-3017"
+            location = "DC-Texas"
+
+            # Keep the scenario deterministic by removing active coverage and old in-flight alerts.
+            db.proposed_orders.update_many(
+                {"sku": sku, "location": location, "status": {"$in": ["awaiting_approval", "approved"]}},
+                {"$set": {"status": "scenario_archived", "archived_at": now}},
+            )
+            db.reorder_alerts.update_many(
+                {"sku": sku, "location": location, "status": {"$in": ["pending", "processing", "awaiting_human_approval"]}},
+                {"$set": {"status": "scenario_archived", "archived_at": now}},
+            )
+
+            db.inventory.update_one(
+                {"sku": sku, "location": location},
+                {"$set": {"on_hand": 600, "on_order": 0, "reorder_point": 1_000}},
+            )
+
+            db.short_term_memory.insert_one({
+                "sku": sku,
+                "location": location,
+                "decided_at": now,
+                "supplier_name": "Insulin Direct",
+                "supplier_id": "SUP-004",
+                "quantity": 400,
+                "confidence": "medium",
+                "days_of_stock_at_decision": 5.0,
+                "auto_approved": False,
+                "decided_by": "human",
+                "human_decision": "rejected",
+                "rationale_summary": "Demo setup: human rejected the non-FDA secondary insulin supplier.",
+            })
+
+            trend_start = now - timedelta(days=13)
+            db.consumption_history.insert_many([
+                {
+                    "timestamp": trend_start + timedelta(days=i),
+                    "sku": sku,
+                    "location": location,
+                    "quantity": 70 + i * 8,
+                    "reason": "context_demo_rising_trend",
+                }
+                for i in range(14)
+            ])
+
+            db.procedures.update_one(
+                {
+                    "sku_category": "pharmaceutical",
+                    "location": location,
+                    "preferred_supplier_id": "SUP-003",
+                },
+                {"$set": {
+                    "sku_category": "pharmaceutical",
+                    "location": location,
+                    "preferred_supplier_id": "SUP-003",
+                    "preferred_supplier_name": "BioPharm Global",
+                    "condition": "category=pharmaceutical AND location=DC-Texas",
+                    "evidence_count": 6,
+                    "human_confirmed": True,
+                    "last_updated": now,
+                }, "$setOnInsert": {"created_at": now}},
+                upsert=True,
+            )
+
+            alert = {
+                "sku": sku,
+                "location": location,
+                "on_hand": 600,
+                "on_order": 0,
+                "reorder_point": 1_000,
+                "units_consumed_last_15min": 0,
+                "avg_daily_consumption": 120.0,
+                "days_of_stock_remaining": 5.0,
+                "status": "pending",
+                "rejection_count": 0,
+                "source": "context_demo",
+                "created_at": now,
+            }
+            db.reorder_alerts.insert_one(alert)
+            db.simulator_control.update_one(
+                {"_id": "main"}, {"$set": {"state": "paused", "speed": 1}}, upsert=True,
+            )
+            st.success("Context scenario ready: MED-3017 alert queued, simulator paused, memory and procedure context seeded.")
+            st.rerun()
 
         # Procedural memory extraction
         st.caption("Extract supplier preference rules from repeated approvals (≥5 same supplier in 30 days).")
@@ -819,7 +909,7 @@ _pending_orders = list(db.proposed_orders.find(
     {"status": "awaiting_approval"}
 ).sort("created_at", -1))
 _history_orders = list(db.proposed_orders.find(
-    {"status": {"$ne": "awaiting_approval"}}
+    {"status": {"$nin": ["awaiting_approval", "scenario_archived"]}}
 ).sort("created_at", -1).limit(5))
 _history_orders.sort(key=lambda o: (
     {"approved": 0, "received": 1, "rejected": 2}.get(o.get("status"), 1),
@@ -1066,6 +1156,7 @@ with right_col:
             confidence    = order.get("confidence", "medium")
             auto_approved = order.get("auto_approved", False)
             used_search   = order.get("atlas_search_used", False)
+            has_context   = bool(order.get("context_manifest"))
 
             review_reason = order.get("review_reason")
             conf_b   = {"high": '<span class="badge b-ok">HIGH</span>',
@@ -1077,6 +1168,7 @@ with right_col:
                         "received":          '<span class="badge b-teal">📦 RECEIVED</span>'}.get(status, "")
             auto_b    = '<span class="badge b-purple">⚡ AUTO</span>'   if auto_approved else ""
             srch_b    = '<span class="badge b-info">🔍 SEARCH</span>'  if used_search   else ""
+            ctx_b     = '<span class="badge b-teal">📦 CONTEXT</span>' if has_context else ""
             review_b  = (
                 f'<span class="badge b-amber" title="{review_reason}">⚠ REVIEW: {review_reason}</span>'
                 if review_reason and status == "awaiting_approval" else ""
@@ -1099,7 +1191,7 @@ with right_col:
     <span class="feed-loc"> @ {order['location']}</span></div>
     <span class="feed-age">{_ago(order.get('created_at'))}</span>
   </div>
-  <div style="margin:4px 0">{conf_b}{status_b}{auto_b}{srch_b}{review_b}</div>
+  <div style="margin:4px 0">{conf_b}{status_b}{auto_b}{srch_b}{ctx_b}{review_b}</div>
   {timing_html}<div class="feed-nums">
     <div><div class="feed-nv">{order['quantity_recommended']:,}</div><div class="feed-nl">Qty</div></div>
     <div><div class="feed-nv">${order['total_cost']:,.0f}</div><div class="feed-nl">Cost</div></div>
@@ -1110,8 +1202,60 @@ with right_col:
 
                 similar = [s for s in order.get("similar_orders", [])
                            if "error" not in s and "info" not in s]
-                with st.expander("💬 Rationale  /  🧠 Vector Search", expanded=False):
+                with st.expander("💬 Rationale  /  📦 Context Packet", expanded=False):
                     st.write(order.get("rationale", "N/A"))
+
+                    manifest = order.get("context_manifest") or {}
+                    if manifest:
+                        st.divider()
+                        st.caption("📦 Context engineered for this recommendation")
+                        cm1, cm2, cm3 = st.columns(3)
+                        _gap = manifest.get("coverage_gap")
+                        cm1.metric("Coverage Gap", f"{_gap:,}" if isinstance(_gap, (int, float)) else "n/a")
+                        cm2.metric("Tools Called", len(manifest.get("tool_sequence", [])))
+                        budget = manifest.get("token_budget", {}) or {}
+                        cm3.metric(
+                            "Context Tokens",
+                            f"{budget.get('total_after', 0):,}/{budget.get('budget', 0):,}"
+                            if budget else "n/a",
+                        )
+
+                        sources = manifest.get("context_sources", [])
+                        if sources:
+                            st.markdown("**What context was included and why**")
+                            st.table([
+                                {
+                                    "Source": s.get("name"),
+                                    "Type": s.get("kind"),
+                                    "Records": s.get("records", 0),
+                                    "Why included": s.get("why"),
+                                }
+                                for s in sources
+                            ])
+
+                        if budget:
+                            trimmed_sections = [
+                                {"Section": name, **meta}
+                                for name, meta in budget.get("sections", {}).items()
+                                if meta.get("trimmed")
+                            ]
+                            if trimmed_sections:
+                                st.markdown("**Token budget trimming**")
+                                st.table(trimmed_sections)
+                            else:
+                                st.caption("Token budget: no sections were trimmed for this recommendation.")
+
+                        tools = manifest.get("tool_sequence", [])
+                        if tools:
+                            st.markdown("**Retrieval trace**")
+                            st.code(" → ".join(tools), language="text")
+
+                        rules = manifest.get("validation_rules", [])
+                        if rules:
+                            st.markdown("**Validation guardrails applied after generation**")
+                            for rule in rules:
+                                st.caption(f"• {rule}")
+
                     if similar:
                         st.caption(f"🧠 {len(similar)} similar past order(s) via Vector Search")
                         for s in similar:

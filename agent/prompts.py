@@ -316,14 +316,15 @@ def build_recommendation_prompt(state: dict) -> str:
     ) or "  No confirmed procedural rules for this category+location yet."
 
     # ── Token budget — trim before assembling the final prompt ──────────
-    from agent.context_budget import trim_to_budget
-    trimmed = trim_to_budget({
+    from agent.context_budget import trim_to_budget_with_report
+    trimmed, budget_report = trim_to_budget_with_report({
         "supplier_lines":  supplier_lines,
         "short_term_lines": short_term_lines,
         "long_term_lines":  long_term_lines,
         "episode_lines":    episode_lines,
         "procedure_lines":  procedure_lines,
     })
+    state["_context_budget_report"] = budget_report
     supplier_lines   = trimmed["supplier_lines"]
     short_term_lines = trimmed["short_term_lines"]
     long_term_lines  = trimmed["long_term_lines"]

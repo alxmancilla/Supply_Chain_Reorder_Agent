@@ -41,7 +41,7 @@ import asyncio
 import json
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import TypedDict
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -58,6 +58,7 @@ from langgraph.checkpoint.mongodb import MongoDBSaver
 
 from agent import sku_lock
 from agent.db import sync_client as _sync_client, db_sync as _db_sync, db_async as _db_async
+from agent.context_manifest import build_context_manifest
 from agent.logger import get_logger
 from agent.schemas import validate_alert, write_dead_letter
 from agent.prompts import (
@@ -97,6 +98,10 @@ log = get_logger(__name__)
 # confidence level.  A procurement specialist, not the agent, approves high-
 # value orders.  Adjust to match your organisation's authority policy.
 _AUTO_APPROVE_MAX_USD = 5_000.00
+
+# Alerts claimed as processing are recovered on startup if the worker dies before
+# completing the graph. This is intentionally longer than a typical LLM run.
+_STALE_PROCESSING_AFTER_SECONDS = 15 * 60
 
 # Categories that require an FDA-registered wholesale distributor.
 # Selecting a non-FDA supplier for these categories is a hard compliance
@@ -155,17 +160,50 @@ _llm_fallback = ChatOpenAI(
 # Circuit breaker state — module-level so it survives across graph invocations.
 _circuit_failures: int = 0
 _CIRCUIT_THRESHOLD: int = 3   # consecutive failures before opening the circuit
+_CIRCUIT_DOC_ID: str = "llm_circuit_breaker"
 
 
 class CircuitOpenError(RuntimeError):
     """Raised when the LLM circuit breaker is open."""
 
 
+def _get_circuit_failures() -> int:
+    """Read circuit-breaker failures from MongoDB, falling back to local memory."""
+    global _circuit_failures
+    try:
+        doc = _db_sync[_AGENT_STATE_COLLECTION].find_one({"_id": _CIRCUIT_DOC_ID})
+        if doc and "failures" in doc:
+            _circuit_failures = int(doc.get("failures", 0))
+    except Exception as exc:
+        log.warning("could not read circuit breaker state", extra={"error": str(exc)})
+    return _circuit_failures
+
+
+def _set_circuit_failures(count: int) -> None:
+    """Persist circuit-breaker failures so dashboard and agent processes agree."""
+    global _circuit_failures
+    _circuit_failures = max(0, int(count))
+    try:
+        _db_sync[_AGENT_STATE_COLLECTION].update_one(
+            {"_id": _CIRCUIT_DOC_ID},
+            {"$set": {"failures": _circuit_failures, "updated_at": datetime.now(timezone.utc)}},
+            upsert=True,
+        )
+    except Exception as exc:
+        log.warning("could not persist circuit breaker state", extra={"error": str(exc)})
+
+
+def reset_circuit_breaker() -> None:
+    """Reset the LLM circuit breaker across processes."""
+    _set_circuit_failures(0)
+
+
 def _get_llm() -> ChatOpenAI:
     """Return the active LLM, raising CircuitOpenError if the circuit is open."""
-    if _circuit_failures >= _CIRCUIT_THRESHOLD:
+    failures = _get_circuit_failures()
+    if failures >= _CIRCUIT_THRESHOLD:
         raise CircuitOpenError(
-            f"LLM circuit breaker open after {_circuit_failures} consecutive failures — "
+            f"LLM circuit breaker open after {failures} consecutive failures — "
             "routing alert to human review queue"
         )
     return _llm_primary
@@ -182,7 +220,7 @@ async def _llm_invoke(messages: list) -> object:
     llm_to_use = _get_llm()
     try:
         response = await llm_to_use.ainvoke(messages)
-        _circuit_failures = 0   # reset on success
+        _set_circuit_failures(0)   # reset on success
         return response
     except CircuitOpenError:
         raise
@@ -190,15 +228,15 @@ async def _llm_invoke(messages: list) -> object:
         log.warning("primary LLM failed, trying fallback", extra={"error": str(primary_exc)})
         try:
             response = await _llm_fallback.ainvoke(messages)
-            _circuit_failures = 0
+            _set_circuit_failures(0)
             return response
         except Exception as fallback_exc:
-            _circuit_failures += 1
+            _set_circuit_failures(_get_circuit_failures() + 1)
             log.error(
                 "fallback LLM also failed",
                 extra={
                     "error":               str(fallback_exc),
-                    "consecutive_failures": _circuit_failures,
+                    "consecutive_failures": _get_circuit_failures(),
                     "threshold":           _CIRCUIT_THRESHOLD,
                 },
             )
@@ -309,6 +347,7 @@ class AgentState(TypedDict):
     long_term_memories:      list   # Semantic memories from agent_memory
     retrieval_results:       dict   # Raw tool results keyed by tool name
     retrieval_trace:         list   # Ordered list of {tool, args} dicts
+    context_budget_report:   dict   # Token budget report for recommendation context
 
     # ── Recommend fields (populated by recommend node) ────────────────────
     analysis:                dict   # {best_supplier_id, confidence, risk_flags, reasoning_trace}
@@ -319,6 +358,9 @@ class AgentState(TypedDict):
     order_id:             str    # _id of the saved proposed_order
     human_approved:       bool   # True when the order was ultimately approved
     final_recommendation: dict   # The rec dict actually used (LLM-generated or synthetic zero-order)
+    decision_source:      str    # "agent" for auto-approval, "human" for HITL decisions
+    human_decision:       str    # "approved" / "rejected" for HITL decisions
+    requeue_alert:        bool   # True when a rejected alert should be retried after memory writes
 
 
 # ---------------------------------------------------------------------------
@@ -536,9 +578,12 @@ async def recommend(state: AgentState) -> dict:
     recommendation: dict = {}
     prior_errors: list[str] = []
     escalate_flag = False
+    context_budget_report: dict = {}
 
     for attempt in range(_MAX_JSON_RETRIES):
-        rec_prompt = build_recommendation_prompt({**ctx, "audit_result": {"errors": prior_errors}})
+        prompt_state = {**ctx, "audit_result": {"errors": prior_errors}}
+        rec_prompt = build_recommendation_prompt(prompt_state)
+        context_budget_report = prompt_state.get("_context_budget_report", context_budget_report)
         if prior_errors:
             rec_prompt += (
                 "\n\nPREVIOUS VALIDATION ERRORS — fix all of these:\n"
@@ -592,6 +637,7 @@ async def recommend(state: AgentState) -> dict:
         "long_term_memories":      long_term_mems,
         "retrieval_results":       retrieval_results,
         "retrieval_trace":         retrieval_trace,
+        "context_budget_report":   context_budget_report,
         "analysis":                analysis,
         "recommendation":          recommendation,
         "escalate_flag":           escalate_flag,
@@ -698,6 +744,8 @@ async def save_order(state: AgentState) -> dict:
     )
 
     # ── Insert proposed_order ────────────────────────────────────────────────
+    alert_oid = ObjectId(alert["_id"]) if isinstance(alert["_id"], str) else alert["_id"]
+    context_manifest = build_context_manifest(state, rec)
     order = {
         "sku":                    alert["sku"],
         "location":               alert["location"],
@@ -712,41 +760,156 @@ async def save_order(state: AgentState) -> dict:
         "similar_orders":         clean_similar,
         "atlas_search_used":      len([r for r in state.get("supplier_search_results", []) if "error" not in r]) > 0,
         "retrieval_trace":        state.get("retrieval_trace", []),
+        "context_manifest":      context_manifest,
         "status":                 "approved" if auto_approved else "awaiting_approval",
         "auto_approved":          auto_approved,
         "review_reason":          review_reason,
         "created_at":             datetime.now(timezone.utc),
-        "alert_id":               ObjectId(alert["_id"]),
+        "alert_id":               alert_oid,
     }
 
-    result   = await _db_async.proposed_orders.insert_one(order)
-    order_id = result.inserted_id
-
-    await _db_async.confidence_outcomes.insert_one({
-        "alert_id":               ObjectId(alert["_id"]),
-        "order_id":               order_id,
-        "predicted_confidence":   confidence,
-        "auto_approved":          auto_approved,
-        "human_decision":         None,
-        "days_to_stock_recovery": None,
-        "outcome":                "pending",
-        "recorded_at":            datetime.now(timezone.utc),
-    })
-
     loop = asyncio.get_running_loop()
-    loop.run_in_executor(
-        None, append_lifecycle_event,
-        alert["_id"], "agent_decision",
-        {"supplier": rec.get("supplier_name"), "quantity": quantity,
-         "confidence": confidence, "auto_approved": auto_approved, "order_id": str(order_id)},
-        alert["sku"], alert["location"],
+
+    existing_order = await _db_async.proposed_orders.find_one(
+        {
+            "alert_id": alert_oid,
+            "status": {"$in": ["awaiting_approval", "approved"]},
+        },
+        sort=[("created_at", -1)],
     )
+
+    existing_human_approved = False
+
+    if existing_order:
+        # LangGraph re-runs the node body when resuming after interrupt(). Any
+        # writes before interrupt() must therefore be idempotent. Reuse the
+        # already-created review order instead of inserting duplicates.
+        order = existing_order
+        order_id = existing_order["_id"]
+        rec = {
+            "supplier_id":   existing_order.get("supplier_id"),
+            "supplier_name": existing_order.get("supplier_name"),
+            "quantity":      existing_order.get("quantity_recommended", 0),
+            "rationale":     existing_order.get("rationale", ""),
+            "confidence":    existing_order.get("confidence", "medium"),
+        }
+        quantity      = existing_order.get("quantity_recommended", quantity)
+        unit_price    = existing_order.get("unit_price", unit_price)
+        total_cost    = existing_order.get("total_cost", total_cost)
+        confidence    = existing_order.get("confidence", confidence)
+        auto_approved = existing_order.get("auto_approved", auto_approved)
+        review_reason = existing_order.get("review_reason", review_reason)
+
+        existing_human_approved = existing_order.get("status") == "approved" and not auto_approved
+    else:
+        result   = await _db_async.proposed_orders.insert_one(order)
+        order_id = result.inserted_id
+
+        await _db_async.confidence_outcomes.update_one(
+            {"alert_id": alert_oid, "order_id": order_id},
+            {"$setOnInsert": {
+                "alert_id":               alert_oid,
+                "order_id":               order_id,
+                "predicted_confidence":   confidence,
+                "auto_approved":          auto_approved,
+                "human_decision":         None,
+                "days_to_stock_recovery": None,
+                "outcome":                "pending",
+                "recorded_at":            datetime.now(timezone.utc),
+            }},
+            upsert=True,
+        )
+
+        loop.run_in_executor(
+            None, append_lifecycle_event,
+            alert["_id"], "agent_decision",
+            {"supplier": rec.get("supplier_name"), "quantity": quantity,
+             "confidence": confidence, "auto_approved": auto_approved, "order_id": str(order_id)},
+            alert["sku"], alert["location"],
+        )
+
+    async def _apply_approved_order_side_effects(approved_by: str | None = None) -> bool:
+        """Apply approval side effects exactly once for this order.
+
+        The order carries `inventory_applied_at` as the idempotency marker. The
+        marker, order status, inventory increment, confidence outcome, and alert
+        completion commit in one MongoDB transaction.
+        """
+        now = datetime.now(timezone.utc)
+        set_fields = {"status": "approved", "inventory_applied_at": now}
+        if approved_by:
+            set_fields.update({"approved_by": approved_by, "approved_at": now})
+
+        applied = False
+        async with await _db_async.client.start_session() as session:
+            async with session.start_transaction():
+                apply_update = await _db_async.proposed_orders.update_one(
+                    {
+                        "_id": order_id,
+                        "status": {"$in": ["awaiting_approval", "approved"]},
+                        "inventory_applied_at": {"$exists": False},
+                    },
+                    {"$set": set_fields},
+                    session=session,
+                )
+                applied = apply_update.modified_count == 1
+
+                current_order = await _db_async.proposed_orders.find_one(
+                    {"_id": order_id}, {"status": 1}, session=session,
+                )
+                accepted = applied or (current_order and current_order.get("status") == "approved")
+
+                if applied:
+                    await _db_async.inventory.update_one(
+                        {"sku": alert["sku"], "location": alert["location"]},
+                        {"$inc": {"on_order": quantity}},
+                        session=session,
+                    )
+                    await _db_async.confidence_outcomes.update_one(
+                        {"order_id": order_id},
+                        {"$set": {
+                            "human_decision": "approved" if approved_by else None,
+                            "outcome": "resolved",
+                        }},
+                        session=session,
+                    )
+
+                if accepted:
+                    await _db_async.reorder_alerts.update_one(
+                        {"_id": alert_oid},
+                        {"$set": {"status": "processed", "order_id": order_id}},
+                        session=session,
+                    )
+
+        return applied
+
+    if existing_human_approved:
+        approved_by = existing_order.get("approved_by", "human") if existing_order else "human"
+        applied = await _apply_approved_order_side_effects(approved_by)
+        if applied:
+            loop.run_in_executor(
+                None, append_lifecycle_event,
+                alert["_id"], "human_approved",
+                {"order_id": str(order_id), "approved_by": approved_by},
+                alert["sku"], alert["location"],
+            )
+        log.info("human-approved order already processed, skipping duplicate resume", extra={
+            "phase": "save_order", "sku": alert["sku"], "order_id": str(order_id),
+        })
+        return {
+            "order_id":             str(order_id),
+            "human_approved":       True,
+            "final_recommendation": rec,
+            "decision_source":      "human",
+            "human_decision":       "approved",
+            "requeue_alert":        False,
+        }
 
     # ── Human-in-the-loop path ───────────────────────────────────────────────
     if not auto_approved:
         # Tag the alert so the Change Stream doesn't re-fire it while we wait.
         await _db_async.reorder_alerts.update_one(
-            {"_id": ObjectId(alert["_id"])},
+            {"_id": alert_oid},
             {"$set": {"status": "awaiting_human_approval", "order_id": order_id}},
         )
 
@@ -774,36 +937,25 @@ async def save_order(state: AgentState) -> dict:
         approver = human_decision.get("approver", "human")
 
         if approved:
-            await _db_async.proposed_orders.update_one(
-                {"_id": order_id},
-                {"$set": {"status": "approved", "approved_by": approver,
-                           "approved_at": datetime.now(timezone.utc)}},
-            )
-            await _db_async.inventory.update_one(
-                {"sku": alert["sku"], "location": alert["location"]},
-                {"$inc": {"on_order": quantity}},
-            )
-            await _db_async.confidence_outcomes.update_one(
-                {"order_id": order_id},
-                {"$set": {"human_decision": "approved", "outcome": "resolved"}},
-            )
-            await _db_async.reorder_alerts.update_one(
-                {"_id": ObjectId(alert["_id"])},
-                {"$set": {"status": "processed", "order_id": order_id}},
-            )
-            loop.run_in_executor(
-                None, append_lifecycle_event,
-                alert["_id"], "human_approved",
-                {"order_id": str(order_id), "approved_by": approver},
-                alert["sku"], alert["location"],
-            )
+            applied = await _apply_approved_order_side_effects(approver)
+            if applied:
+                loop.run_in_executor(
+                    None, append_lifecycle_event,
+                    alert["_id"], "human_approved",
+                    {"order_id": str(order_id), "approved_by": approver},
+                    alert["sku"], alert["location"],
+                )
+            else:
+                log.info("approval already applied, skipping inventory increment", extra={
+                    "phase": "save_order", "sku": alert["sku"], "order_id": str(order_id),
+                })
             log.info("human approved order", extra={
                 "phase": "save_order", "sku": alert["sku"],
                 "order_id": str(order_id), "approved_by": approver,
             })
         else:
-            # Rejection: reset the alert to pending so the Change Stream re-fires
-            # and the agent retries with the rejection visible in short-term memory.
+            # Rejection is re-queued only after write_memories runs. This ensures
+            # the next agent attempt sees the human rejection signal in memory.
             reason = human_decision.get("reason", "human_rejected")
             await _db_async.proposed_orders.update_one(
                 {"_id": order_id}, {"$set": {"status": "rejected"}},
@@ -811,14 +963,6 @@ async def save_order(state: AgentState) -> dict:
             await _db_async.confidence_outcomes.update_one(
                 {"order_id": order_id},
                 {"$set": {"human_decision": "rejected", "outcome": "escalated"}},
-            )
-            await _db_async.reorder_alerts.update_one(
-                {"_id": ObjectId(alert["_id"])},
-                {
-                    "$set":   {"status": "pending"},
-                    "$unset": {"order_id": ""},
-                    "$inc":   {"rejection_count": 1},
-                },
             )
             loop.run_in_executor(
                 None, append_lifecycle_event,
@@ -840,23 +984,24 @@ async def save_order(state: AgentState) -> dict:
             "order_id":             str(order_id),
             "human_approved":       approved,
             "final_recommendation": rec,
+            "decision_source":      "human",
+            "human_decision":       "approved" if approved else "rejected",
+            "requeue_alert":        not approved,
         }
 
     # ── Auto-approved path ───────────────────────────────────────────────────
-    await _db_async.reorder_alerts.update_one(
-        {"_id": ObjectId(alert["_id"])},
-        {"$set": {"status": "processed", "order_id": order_id}},
-    )
-    await _db_async.inventory.update_one(
-        {"sku": alert["sku"], "location": alert["location"]},
-        {"$inc": {"on_order": quantity}},
-    )
-    loop.run_in_executor(
-        None, append_lifecycle_event,
-        alert["_id"], "order_placed",
-        {"order_id": str(order_id), "status": "approved"},
-        alert["sku"], alert["location"],
-    )
+    applied = await _apply_approved_order_side_effects()
+    if applied:
+        loop.run_in_executor(
+            None, append_lifecycle_event,
+            alert["_id"], "order_placed",
+            {"order_id": str(order_id), "status": "approved"},
+            alert["sku"], alert["location"],
+        )
+    else:
+        log.info("approved order side effects already applied", extra={
+            "phase": "save_order", "sku": alert["sku"], "order_id": str(order_id),
+        })
 
     log.info("order auto-approved", extra={
         "phase":                 "save_order",
@@ -872,6 +1017,9 @@ async def save_order(state: AgentState) -> dict:
         "order_id":             str(order_id),
         "human_approved":       True,
         "final_recommendation": rec,
+        "decision_source":      "agent",
+        "human_decision":       None,
+        "requeue_alert":        False,
     }
 
 
@@ -906,6 +1054,8 @@ async def write_memories(state: AgentState) -> dict:
     alert    = state["alert"]
     rec      = state.get("final_recommendation") or {}
     approved = state.get("human_approved", True)
+    decision_source = state.get("decision_source", "agent")
+    human_decision = state.get("human_decision") if decision_source == "human" else None
 
     chosen     = next(
         (s for s in state.get("suppliers", []) if s.get("supplier_id") == rec.get("supplier_id")),
@@ -941,7 +1091,9 @@ async def write_memories(state: AgentState) -> dict:
         # Shows: basic CRUD + TTL indexes in MongoDB.
         loop.run_in_executor(
             None, write_short_term_memory_sync,
-            alert["sku"], alert["location"], rec, days_remaining, approved,
+            alert["sku"], alert["location"], rec, days_remaining,
+            approved and decision_source != "human",
+            decision_source, human_decision,
         ),
         # ── agent_memory (long-term) ───────────────────────────────────────
         # Generates a Voyage AI embedding of the decision summary and stores
@@ -950,7 +1102,9 @@ async def write_memories(state: AgentState) -> dict:
         loop.run_in_executor(
             None, write_long_term_memory_sync,
             alert["sku"], item_name, alert["location"],
-            rec, days_remaining, trend, approved,
+            rec, days_remaining, trend,
+            approved and decision_source != "human",
+            decision_source, human_decision,
         ),
         # ── order_history ──────────────────────────────────────────────────
         # Detailed record of every order placed, used by find_similar_past_orders
@@ -972,6 +1126,20 @@ async def write_memories(state: AgentState) -> dict:
         "approved": approved,
         "order_id": order_id_str,
     })
+
+    if state.get("requeue_alert"):
+        alert_oid = ObjectId(alert["_id"]) if isinstance(alert["_id"], str) else alert["_id"]
+        await _db_async.reorder_alerts.update_one(
+            {"_id": alert_oid},
+            {
+                "$set":   {"status": "pending"},
+                "$unset": {"order_id": ""},
+                "$inc":   {"rejection_count": 1},
+            },
+        )
+        log.info("rejected alert re-queued after memory write", extra={
+            "phase": "write_memories", "sku": alert["sku"], "order_id": order_id_str,
+        })
     return {}
 
 
@@ -1176,14 +1344,15 @@ async def _process_one_alert(alert_doc: dict) -> None:
     alert_id  = thread_id
 
     # ── 1. Circuit breaker ────────────────────────────────────────────────────
-    if _circuit_failures >= _CIRCUIT_THRESHOLD:
+    if _get_circuit_failures() >= _CIRCUIT_THRESHOLD:
         log.error("circuit breaker open, routing to human review queue", extra={
             "phase": "process_alert", "sku": sku,
         })
+        alert_oid = ObjectId(alert_doc["_id"])
         _db_sync.human_review_queue.update_one(
-            {"alert_id": ObjectId(alert_doc["_id"])},
+            {"alert_id": alert_oid},
             {"$set": {
-                "alert_id":       ObjectId(alert_doc["_id"]),
+                "alert_id":       alert_oid,
                 "sku":            sku,
                 "location":       location,
                 "reason":         "llm_circuit_open",
@@ -1191,6 +1360,10 @@ async def _process_one_alert(alert_doc: dict) -> None:
                 "alert_snapshot": alert_doc,
             }},
             upsert=True,
+        )
+        _db_sync.reorder_alerts.update_one(
+            {"_id": alert_oid},
+            {"$set": {"status": "human_review", "last_error": "llm_circuit_open"}},
         )
         return
 
@@ -1227,7 +1400,7 @@ async def _process_one_alert(alert_doc: dict) -> None:
     # already grabbed this alert (or it was already processed).
     claimed = await _db_async.reorder_alerts.find_one_and_update(
         {"_id": ObjectId(alert_doc["_id"]), "status": "pending"},
-        {"$set": {"status": "processing"}},
+        {"$set": {"status": "processing", "processing_started_at": datetime.now(timezone.utc)}},
     )
     if claimed is None:
         log.info("alert already claimed by another worker, skipping", extra={
@@ -1268,6 +1441,75 @@ async def _process_one_alert(alert_doc: dict) -> None:
         config    = {"configurable": {"thread_id": thread_id}}
         await graph.ainvoke({"alert": alert_doc}, config=config)
         log.info("alert processed", extra={"phase": "process_alert", "sku": sku})
+    except Exception as exc:  # noqa: BLE001
+        alert_oid = ObjectId(alert_id)
+        error_count = int(claimed.get("processing_error_count", 0)) + 1
+        error_msg = str(exc)[:1000]
+
+        if isinstance(exc, CircuitOpenError) or _get_circuit_failures() >= _CIRCUIT_THRESHOLD:
+            await _db_async.human_review_queue.update_one(
+                {"alert_id": alert_oid},
+                {"$set": {
+                    "alert_id":       alert_oid,
+                    "sku":            sku,
+                    "location":       location,
+                    "reason":         "llm_circuit_open",
+                    "queued_at":      datetime.now(timezone.utc),
+                    "alert_snapshot": claimed,
+                    "last_error":     error_msg,
+                }},
+                upsert=True,
+            )
+            await _db_async.reorder_alerts.update_one(
+                {"_id": alert_oid},
+                {"$set": {"status": "human_review", "last_error": error_msg}},
+            )
+            log.error("alert routed to human review after circuit failure", extra={
+                "phase": "process_alert", "sku": sku, "error": error_msg,
+            })
+        elif error_count >= 3:
+            await _db_async.escalation_queue.update_one(
+                {"alert_id": alert_oid},
+                {"$set": {
+                    "alert_id":          alert_oid,
+                    "sku":               sku,
+                    "location":          location,
+                    "processing_errors": error_count,
+                    "escalated_at":      datetime.now(timezone.utc),
+                    "escalation_reason": "processing_errors",
+                    "last_error":        error_msg,
+                }},
+                upsert=True,
+            )
+            await _db_async.reorder_alerts.update_one(
+                {"_id": alert_oid},
+                {"$set": {
+                    "status": "escalated",
+                    "processing_error_count": error_count,
+                    "last_error": error_msg,
+                }},
+            )
+            webhook_url = os.getenv("ESCALATION_WEBHOOK_URL")
+            if webhook_url:
+                await _notify_escalation_webhook(webhook_url, sku, claimed, "processing_errors")
+            log.error("alert escalated after repeated processing errors", extra={
+                "phase": "process_alert", "sku": sku,
+                "processing_errors": error_count, "error": error_msg,
+            })
+        else:
+            await _db_async.reorder_alerts.update_one(
+                {"_id": alert_oid},
+                {"$set": {
+                    "status": "pending",
+                    "processing_error_count": error_count,
+                    "last_error": error_msg,
+                    "last_failed_at": datetime.now(timezone.utc),
+                }},
+            )
+            log.error("alert processing failed, reset to pending", extra={
+                "phase": "process_alert", "sku": sku,
+                "processing_errors": error_count, "error": error_msg,
+            })
     finally:
         await sku_lock.release(_db_async, sku, location, alert_id)
 
@@ -1293,6 +1535,39 @@ async def _drain_existing_pending_alerts() -> None:
                        extra={"sku": sku, "error": str(exc)})
     if count:
         log.info("startup: drained pre-existing pending alerts", extra={"count": count})
+
+
+async def _recover_stale_processing_alerts() -> int:
+    """Requeue alerts left in processing by a crashed worker.
+
+    The alert claim path stamps processing_started_at. On startup, any processing
+    alert older than the timeout is safe to retry because no in-process graph can
+    survive an agent process restart. Documents without the timestamp are treated
+    as legacy stale records from before this recovery field existed.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=_STALE_PROCESSING_AFTER_SECONDS)
+    result = await _db_async.reorder_alerts.update_many(
+        {
+            "status": "processing",
+            "$or": [
+                {"processing_started_at": {"$lt": cutoff}},
+                {"processing_started_at": {"$exists": False}},
+            ],
+        },
+        {
+            "$set": {
+                "status": "pending",
+                "recovered_from_stale_processing_at": datetime.now(timezone.utc),
+            },
+            "$unset": {"processing_started_at": ""},
+        },
+    )
+    if result.modified_count:
+        log.warning("startup: recovered stale processing alerts", extra={
+            "count": result.modified_count,
+            "stale_after_seconds": _STALE_PROCESSING_AFTER_SECONDS,
+        })
+    return result.modified_count
 
 
 # ---------------------------------------------------------------------------
@@ -1374,6 +1649,7 @@ async def watch_alerts() -> None:
 
     _assert_vector_index_dims()
 
+    await _recover_stale_processing_alerts()
     await _drain_existing_pending_alerts()
 
     while True:
