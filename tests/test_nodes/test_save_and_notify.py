@@ -11,7 +11,7 @@ import pytest
 # Pure-logic replicas (mirrors save_and_notify without DB / async)
 # ---------------------------------------------------------------------------
 
-AUTO_APPROVE_MAX_COST = 2_500.00
+AUTO_APPROVE_MAX_COST = 5_000.00
 
 
 def _build_synthetic_zero_rec(state: dict) -> dict:
@@ -128,8 +128,8 @@ class TestAutoApproveLogic:
         assert order["status"] == "approved"
 
     def test_high_confidence_high_cost_awaits_approval(self):
-        # 300 × $10 = $3000 > $2500 threshold
-        order = _compute_order(_state(confidence="high", quantity=300, unit_price=10.0))
+        # 600 x $10 = $6000 > $5000 threshold
+        order = _compute_order(_state(confidence="high", quantity=600, unit_price=10.0))
         assert order["auto_approved"] is False
         assert order["status"] == "awaiting_approval"
 
@@ -149,15 +149,15 @@ class TestAutoApproveLogic:
         assert order["status"] == "approved"
 
     def test_auto_approve_boundary_just_under_threshold(self):
-        # $2499.99 → should auto-approve
-        order = _compute_order(_state(confidence="high", quantity=249, unit_price=10.0))
-        assert order["total_cost"] == 2490.0
+        # $4990 -> should auto-approve
+        order = _compute_order(_state(confidence="high", quantity=499, unit_price=10.0))
+        assert order["total_cost"] == 4990.0
         assert order["auto_approved"] is True
 
-    def test_auto_approve_boundary_just_over_threshold(self):
-        # $2510 → should NOT auto-approve
-        order = _compute_order(_state(confidence="high", quantity=251, unit_price=10.0))
-        assert order["total_cost"] == 2510.0
+    def test_auto_approve_boundary_at_threshold(self):
+        # $5000 -> should NOT auto-approve
+        order = _compute_order(_state(confidence="high", quantity=500, unit_price=10.0))
+        assert order["total_cost"] == 5000.0
         assert order["auto_approved"] is False
 
 
