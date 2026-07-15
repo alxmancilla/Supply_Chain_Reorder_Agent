@@ -39,6 +39,8 @@ alerts_collection   = db["reorder_alerts"]
 control_collection  = db["simulator_control"]
 orders_collection   = db["proposed_orders"]
 
+_ACTIVE_ALERT_STATUSES = ["pending", "processing", "awaiting_human_approval", "human_review"]
+
 # ---------------------------------------------------------------------------
 # Demo time: 1 real-world minute = 1 demo day.
 # Orders marked "approved" are delivered after their expected_delivery_days
@@ -124,14 +126,14 @@ def check_and_alert(sku_doc: dict, consumption: int) -> None:
         avg_daily = get_avg_daily_consumption(sku)
         days_remaining = round(on_hand / avg_daily, 1) if avg_daily > 0 else 0.0
 
-        # Skip if an unprocessed alert already exists for this SKU + location
+        # Skip if an active alert already exists for this SKU + location.
         existing = alerts_collection.find_one({
             "sku": sku,
             "location": sku_doc["location"],
-            "status": "pending",
+            "status": {"$in": _ACTIVE_ALERT_STATUSES},
         })
         if existing:
-            log.info("alert already pending, skipping", extra={
+            log.info("active alert already exists, skipping", extra={
                 "sku": sku, "location": sku_doc["location"],
                 "on_hand": on_hand, "days_remaining": days_remaining,
             })

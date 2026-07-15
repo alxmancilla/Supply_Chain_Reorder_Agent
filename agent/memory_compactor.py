@@ -149,9 +149,9 @@ def compact_old_memories() -> int:
 
             # Re-embed the composite so it remains vector-searchable.
             # Import here to avoid circular imports at module level.
-            from agent.tools import _get_embedding  # type: ignore[attr-defined]
+            from agent.tools import _get_document_embedding  # type: ignore[attr-defined]
             try:
-                embedding = _get_embedding(composite_content[:2000])
+                embedding = _get_document_embedding(composite_content[:2000])
             except Exception as exc:
                 print(
                     f"  [compactor] Embedding failed for {sku} @ {location}: {exc} — skipping"

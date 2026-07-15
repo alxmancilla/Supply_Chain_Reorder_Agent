@@ -512,6 +512,20 @@ async def recommend(state: AgentState) -> dict:
     short_term_mems = retrieval_results.get("get_recent_decisions", [])
     long_term_mems  = retrieval_results.get("get_learned_patterns", [])
 
+    if long_term_mems:
+        long_term_mems = [
+            m for m in long_term_mems
+            if not isinstance(m, dict)
+            or "error" in m
+            or "info" in m
+            or m.get("location") in (None, alert["location"])
+        ]
+    else:
+        long_term_mems = get_long_term_memories(
+            context,
+            location=alert["location"],
+        )
+
     def _count(results: list) -> int:
         return len([r for r in results if "error" not in r and "info" not in r])
 
@@ -1191,7 +1205,9 @@ async def escalate_alert(state: AgentState) -> AgentState:
 
     alert_oid = ObjectId(alert["_id"]) if isinstance(alert["_id"], str) else alert["_id"]
 
-    lifecycle_doc = _db_sync.alert_lifecycle.find_one({"alert_id": str(alert.get("_id", ""))})
+    lifecycle_doc = _db_sync.alert_lifecycle.find_one({
+        "alert_id": {"$in": [alert_oid, str(alert_oid)]},
+    })
     rejection_history = []
     if lifecycle_doc:
         rejection_history = [
@@ -1577,10 +1593,15 @@ async def _recover_stale_processing_alerts() -> int:
 # ---------------------------------------------------------------------------
 
 #: Expected embedding dimensions for every vector index used by the agent.
-#: Update this dict whenever the embedding model or index definition changes.
-_VECTOR_INDEX_DIMS: dict[str, int] = {
-    "order_history_vector_index": 1024,   # voyage-4-large
-    "agent_memory_vector_index":  1024,   # voyage-4-large
+#: Map collection -> index -> expected dimensions. Update this dict whenever
+#: the embedding model or index definition changes.
+_VECTOR_INDEX_DIMS: dict[str, dict[str, int]] = {
+    "order_history": {
+        "order_history_vector_index": 1024,   # voyage-4-large
+    },
+    "agent_memory": {
+        "agent_memory_vector_index": 1024,    # voyage-4-large
+    },
 }
 
 
@@ -1591,42 +1612,60 @@ def _assert_vector_index_dims() -> None:
     an index is missing or has the wrong dimension — the agent can still run, but
     vector search will return zero results until the index is rebuilt.
     """
-    for collection_name, expected_dims in _VECTOR_INDEX_DIMS.items():
+    for collection_name, indexes_by_name in _VECTOR_INDEX_DIMS.items():
         collection = _db_sync[collection_name]
-        try:
-            indexes = list(collection.aggregate([{"$listSearchIndexes": {}}]))
-        except Exception as exc:
-            log.warning(
-                "vector-dim preflight: could not list indexes",
-                extra={"collection": collection_name, "error": str(exc)},
-            )
-            continue
+        for index_name, expected_dims in indexes_by_name.items():
+            try:
+                indexes = list(collection.aggregate([
+                    {"$listSearchIndexes": {"name": index_name}},
+                ]))
+            except Exception as exc:
+                log.warning(
+                    "vector-dim preflight: could not list indexes",
+                    extra={"collection": collection_name, "index": index_name, "error": str(exc)},
+                )
+                continue
 
-        for idx in indexes:
-            fields = idx.get("latestDefinition", {}).get("fields", [])
-            for field in fields:
-                if field.get("type") == "vector":
-                    actual = field.get("numDimensions")
-                    if actual != expected_dims:
-                        log.warning(
-                            "vector index dimension mismatch — vector search will return zero hits",
-                            extra={
-                                "collection":   collection_name,
-                                "index":        idx.get("name"),
-                                "expected_dims": expected_dims,
-                                "actual_dims":  actual,
-                                "fix":          "re-run data/seed.py to rebuild the index",
-                            },
-                        )
-                    else:
-                        log.info(
-                            "vector index dims OK",
-                            extra={
-                                "collection": collection_name,
-                                "index":      idx.get("name"),
-                                "dims":       actual,
-                            },
-                        )
+            if not indexes:
+                log.warning(
+                    "vector-dim preflight: index missing",
+                    extra={
+                        "collection": collection_name,
+                        "index":      index_name,
+                        "fix":        "re-run data/seed.py to rebuild the index",
+                    },
+                )
+                continue
+
+            vector_fields = [
+                field
+                for field in indexes[0].get("latestDefinition", {}).get("fields", [])
+                if field.get("type") == "vector"
+            ]
+            if not vector_fields:
+                log.warning(
+                    "vector-dim preflight: index has no vector field",
+                    extra={"collection": collection_name, "index": index_name},
+                )
+                continue
+
+            actual = vector_fields[0].get("numDimensions")
+            if actual != expected_dims:
+                log.warning(
+                    "vector index dimension mismatch — vector search will return zero hits",
+                    extra={
+                        "collection":    collection_name,
+                        "index":         index_name,
+                        "expected_dims": expected_dims,
+                        "actual_dims":   actual,
+                        "fix":           "re-run data/seed.py to rebuild the index",
+                    },
+                )
+            else:
+                log.info(
+                    "vector index dims OK",
+                    extra={"collection": collection_name, "index": index_name, "dims": actual},
+                )
 
 
 async def watch_alerts() -> None:

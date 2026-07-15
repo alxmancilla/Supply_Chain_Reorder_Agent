@@ -48,6 +48,8 @@ inventory           = _db["inventory"]
 consumption_history = _db["consumption_history"]
 alerts_collection   = _db["reorder_alerts"]
 
+_ACTIVE_ALERT_STATUSES = ["pending", "processing", "awaiting_human_approval", "human_review"]
+
 log = get_logger(__name__)
 
 KAFKA_BROKER = os.environ.get("KAFKA_BROKER", "localhost:9094")
@@ -115,10 +117,10 @@ def check_and_alert(sku: str, location: str, quantity: int,
     days_remaining = round(on_hand / avg_daily, 1) if avg_daily > 0 else 0.0
 
     existing = alerts_collection.find_one(
-        {"sku": sku, "location": location, "status": "pending"}
+        {"sku": sku, "location": location, "status": {"$in": _ACTIVE_ALERT_STATUSES}}
     )
     if existing:
-        log.info("alert already pending, skipping", extra={
+        log.info("active alert already exists, skipping", extra={
             "sku": sku, "location": location, "on_hand": on_hand,
         })
         return

@@ -34,7 +34,7 @@ _voyage = voyageai.Client(api_key=os.environ["VOYAGE_API_KEY"])
 _EMBEDDING_MODEL = "voyage-4-large"
 
 
-def _get_embedding(text: str, max_retries: int = 3) -> list:
+def _get_embedding(text: str, max_retries: int = 3, input_type: str = "query") -> list:
     """Embed a text string with Voyage AI voyage-4-large.
 
     Retries up to max_retries times with exponential back-off (1 s → 2 s → 4 s)
@@ -42,7 +42,7 @@ def _get_embedding(text: str, max_retries: int = 3) -> list:
     """
     for attempt in range(max_retries):
         try:
-            result = _voyage.embed([text], model=_EMBEDDING_MODEL, input_type="query")
+            result = _voyage.embed([text], model=_EMBEDDING_MODEL, input_type=input_type)
             return result.embeddings[0]
         except Exception as exc:
             if attempt < max_retries - 1:
@@ -53,6 +53,16 @@ def _get_embedding(text: str, max_retries: int = 3) -> list:
                 time.sleep(wait)
             else:
                 raise
+
+
+def _get_query_embedding(text: str, max_retries: int = 3) -> list:
+    """Embed retrieval queries with Voyage's query-side embedding mode."""
+    return _get_embedding(text, max_retries=max_retries, input_type="query")
+
+
+def _get_document_embedding(text: str, max_retries: int = 3) -> list:
+    """Embed persisted memories/orders with Voyage's document-side embedding mode."""
+    return _get_embedding(text, max_retries=max_retries, input_type="document")
 
 
 # ---------------------------------------------------------------------------
@@ -293,7 +303,7 @@ def find_similar_past_orders(
     improving relevance precision without shrinking the candidate pool unnecessarily.
     """
     try:
-        query_embedding = _get_embedding(situation_text)
+        query_embedding = _get_query_embedding(situation_text)
     except Exception as exc:
         return [{"error": f"Embedding generation failed: {exc}"}]
 
@@ -426,7 +436,8 @@ def write_short_term_memory_sync(
 # ---------------------------------------------------------------------------
 
 def get_long_term_memories(
-    situation_text: str, limit: int = 3, min_score: float = 0.72
+    situation_text: str, limit: int = 3, min_score: float = 0.72,
+    location: str | None = None,
 ) -> list:
     """
     Vector search on agent_memory: retrieve the most relevant past learnings
@@ -434,20 +445,24 @@ def get_long_term_memories(
     The collection grows as the agent makes decisions — empty on first run.
     """
     try:
-        query_embedding = _get_embedding(situation_text)
+        query_embedding = _get_query_embedding(situation_text)
     except Exception as exc:
         return [{"error": f"Embedding generation failed: {exc}"}]
 
     fetch_limit = limit + 5
+    vector_search_stage: dict = {
+        "index":         "agent_memory_vector_index",
+        "path":          "embedding",
+        "queryVector":   query_embedding,
+        "numCandidates": max(50, fetch_limit * 4),
+        "limit":         fetch_limit,
+    }
+    if location:
+        vector_search_stage["filter"] = {"location": {"$eq": location}}
+
     pipeline = [
         {
-            "$vectorSearch": {
-                "index":         "agent_memory_vector_index",
-                "path":          "embedding",
-                "queryVector":   query_embedding,
-                "numCandidates": max(50, fetch_limit * 4),
-                "limit":         fetch_limit,
-            }
+            "$vectorSearch": vector_search_stage
         },
         {"$addFields": {"memory_score": {"$meta": "vectorSearchScore"}}},
         {"$match": {"memory_score": {"$gte": min_score}}},
@@ -484,7 +499,7 @@ def write_order_history_sync(
     proposed_order_id links back to proposed_orders for targeted outcome updates.
     """
     try:
-        embedding = _get_embedding(rationale)
+        embedding = _get_document_embedding(rationale)
         _db.order_history.insert_one({
             "sku":                  sku,
             "location":             location,
@@ -542,7 +557,7 @@ def write_long_term_memory_sync(
         "created_at":    datetime.now(timezone.utc).isoformat(),
     }
     try:
-        embedding = _get_embedding(content)
+        embedding = _get_document_embedding(content)
         _db.agent_memory.insert_one({
             **payload,
             "embedding":  embedding,
@@ -651,12 +666,13 @@ def get_recent_decisions(sku: str, location: str) -> list:
 
 
 @tool
-def get_learned_patterns(situation_description: str) -> list:
+def get_learned_patterns(situation_description: str, location: str | None = None) -> list:
     """Retrieve semantically similar past procurement patterns from long-term memory.
     Provide a plain-English description of the current situation (SKU, location,
     urgency level, stock level, and category) to find relevant historical decisions
-    and their outcomes. Returns entries scored by semantic similarity."""
-    return get_long_term_memories(situation_description)
+    and their outcomes. Pass location to keep memories scoped to the same warehouse.
+    Returns entries scored by semantic similarity."""
+    return get_long_term_memories(situation_description, location=location)
 
 
 # ---------------------------------------------------------------------------
