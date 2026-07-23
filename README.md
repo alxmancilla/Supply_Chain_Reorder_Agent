@@ -1,179 +1,63 @@
 # Supply Chain Reorder Alert Agent
 
-A demonstration supply chain reorder alert agent built with **MongoDB Atlas**, **LangChain**, **LangGraph**, **GPT-4o** (via Grove API gateway), and **Voyage AI** embeddings.
+An AI agent that monitors healthcare inventory in real time, detects stockouts, and autonomously drafts purchase orders — with human approval for anything above the auto-approve threshold.
 
-The agent monitors simulated inventory events, detects when stock drops below a reorder point, and coordinates a multi-agent pipeline to evaluate suppliers, draft purchase orders with plain-English rationale, validate output, and escalate edge cases — all in real time.
+**Stack:** MongoDB Atlas · LangGraph · LangChain · GPT-4o · Voyage AI
 
-> **This is a demo.** Data is simulated. Prioritises clarity and MongoDB feature visibility over production robustness.
-
----
-
-## Architecture
-
-```
-stream_simulator.py          agent/graph.py                              app.py
-──────────────────     →     ────────────────────────────────     →     ──────────────────
-Simulates Atlas              LangGraph multi-agent state machine          Streamlit dashboard
-Stream Processing            watches reorder_alerts via Change            shows live inventory,
-                             Stream, coordinates specialist               alerts, and agent
-Writes reorder_alerts        agents, saves proposed_orders,              decisions with
-to MongoDB every 5 s         reads/writes dual-layer memory              Approve/Reject buttons
-```
-
-For a Mermaid data-flow diagram see [DASHBOARD_ARCHITECTURE.md](DASHBOARD_ARCHITECTURE.md).
-For node-by-node agent diagrams see [WORKFLOW.md](WORKFLOW.md).
+> **Demo project.** All inventory data is simulated. Designed to showcase MongoDB Atlas capabilities in an agentic workflow.
 
 ---
 
-## Multi-Agent Graph Topology
+## How it works
 
 ```
-START
-  → assess_alert
-  → route_by_urgency (conditional)
-      ↘ save_order    (zero-gap fast path — no LLM)
-      ↘ recommend     (retrieval + analysis + recommendation + validation)
-          ↘ escalate  (validation exhausted after all retries)
-          ↘ save_order
-              → write_memories    (short-term, long-term, history)
-END
+Simulator → reorder_alerts (MongoDB) → Agent (LangGraph) → proposed_orders → Dashboard
 ```
+
+The simulator writes a reorder alert whenever stock falls below the reorder point. The agent picks it up via a **Change Stream**, runs a 5-node pipeline, and either auto-approves the order or pauses for human review.
+
+### Agent pipeline
 
 | Node | What it does |
 |---|---|
-| `assess_alert` | Fetches live inventory position from MongoDB; sums active orders to compute `coverage_gap`; sets `expedite` flag when `< 2 days` remaining |
-| `route_by_urgency` | Conditional edge — zero-gap alerts skip the LLM entirely; everything else goes to `recommend` |
-| `recommend` | **The core reasoning node.** Runs a ReAct tool-calling loop to gather context (Atlas Search, Vector Search, time series, memory), then calls the LLM twice — once for supplier analysis (confidence score) and once for the order recommendation (quantity + rationale). Validates inline; retries up to 3× before setting `escalate_flag` |
-| `save_order` | Writes `proposed_orders`; **auto-approves** if confidence is `high` and cost `< $5,000`; otherwise calls **`interrupt()`** — LangGraph freezes the graph state to the `checkpoints` collection (MongoDBSaver) and waits for a human decision; the dashboard resumes with `Command(resume={...})` |
-| `write_memories` | Runs after `save_order` completes; writes short-term memory (24 h TTL), long-term semantic embedding (`agent_memory`), and order history in parallel |
-| `escalate` | Writes to `escalation_queue`; sets alert status to `"escalated"`; optionally POSTs a webhook notification |
+| `assess_alert` | Reads live inventory; calculates coverage gap and urgency |
+| `route_by_urgency` | Zero-gap alerts skip the LLM; all others go to `recommend` |
+| `recommend` | ReAct loop: queries Atlas Search, Vector Search, time-series trend, and memory — then calls GPT-4o to pick a supplier, quantity, and rationale |
+| `save_order` | Writes the order. **Auto-approves** if confidence is `high` and cost < $5,000; otherwise pauses for human review via LangGraph `interrupt()` |
+| `write_memories` | Persists the decision to short-term memory (TTL 24h), long-term semantic memory, and order history |
 
-Every graph invocation is checkpointed to MongoDB via **LangGraph `MongoDBSaver`** (`checkpoints` collection).
+Full diagrams: [WORKFLOW.md](WORKFLOW.md) · [DASHBOARD_ARCHITECTURE.md](DASHBOARD_ARCHITECTURE.md)
 
-### ReAct Retrieval Agent — available tools
+### Human-in-the-Loop
 
-| Tool | MongoDB feature | Purpose |
-|---|---|---|
-| `get_inventory_position` | Basic `find` | Live on-hand, on-order, reorder-point |
-| `get_supplier_options` | `find`, sort by fill rate | Approved suppliers for the SKU |
-| `get_consumption_trend` | **Time Series** aggregation | 14-day avg daily demand + trend direction |
-| `search_suppliers_by_capability` | **Atlas Search** (`$rankFusion`) | RRF hybrid search combining a `name_match` pipeline (0.4 weight) and a `capability_match` pipeline (0.6 weight); falls back to compound `$search` on M0 tier |
-| `find_similar_past_orders` | **Atlas Vector Search** (`$vectorSearch`) on `order_history` | Semantically similar historical orders as precedent (score ≥ 0.78) |
-| `get_episode_history` | `find` on `alert_lifecycle` | Full event timeline for the 3 most recent past alerts for this SKU+location |
+When an order needs review, `save_order` calls `interrupt()` — LangGraph serialises the full graph state to MongoDB (`checkpoints` collection) and pauses. The dashboard shows a review card with an Approve / Reject button.
 
-Short-term and long-term memories are injected directly into the recommendation agent's prompt, not fetched via tools.
+- **Approve** → `asyncio.run(_agent_graph.ainvoke(Command(resume={"approved": True, ...})))` resumes from the exact pause point.
+- **Reject** → alert resets to `"pending"`; agent reprocesses with the rejection visible in memory (`⚠ HUMAN REJECTED` tag).
+- **3 rejections** → alert escalates automatically.
 
----
+> Open the `checkpoints` collection in Atlas while a graph is paused to see the entire agent state serialised in a single document.
 
-## Real-Time Coordination
+### Auto-approve criteria
 
-### The problem
-
-Between the moment `assess_alert` reads the inventory gap and the moment `save_order` writes the order (~20–30 s of LLM pipeline), a second alert for the same SKU+location could arrive, pass the same gap check, and result in a duplicate order. This TOCTOU (time-of-check/time-of-use) race is real when multiple workers run concurrently.
-
-### The fix — two layers of mutual exclusion
-
-**1. Atomic alert claim (`pending → processing`)**
-
-In `_process_one_alert`, before invoking the graph, the alert status is transitioned atomically:
-
-```python
-claimed = await _db_async.reorder_alerts.find_one_and_update(
-    {"_id": alert_oid, "status": "pending"},
-    {"$set": {"status": "processing"}},
-)
-```
-
-Only one worker can win this update. If `claimed` is `None`, the alert was already taken — skip without processing.
-
-**2. SKU-level distributed lock (`agent/sku_lock.py`)**
-
-After claiming the alert, the worker acquires an exclusive MongoDB-backed lock for `(sku, location)`:
-
-- A unique compound index on `sku_processing_locks.{sku, location}` makes the `insert_one` atomic — only one `insert_one` can succeed.
-- If the lock is held, the worker retries with exponential backoff (1 s → 2 s → 4 s → 8 s → 16 s, up to ~47 s total).
-- If the lock cannot be acquired after all retries, the alert is reset to `"pending"` — the Change Stream re-fires it.
-- A TTL index on `expires_at` (5-minute window) auto-expires stale locks from crashed workers.
-- `release()` scopes its `delete_one` to `held_by` — a late release from a crashed worker can never evict a lock held by a different alert.
-
-```
-Worker A                          Worker B
-─────────────────────────────     ─────────────────────────────
-claim alert-1 ✓                   claim alert-2 ✓
-acquire SKU lock ✓                acquire SKU lock ✗ (retrying…)
-assess_alert → coverage_gap=155
-[LLM pipeline ~20 s]
-save_order → order written
-release SKU lock                  acquire SKU lock ✓
-                                  assess_alert → coverage_gap=0
-                                  zero-gap fast path → no order
-                                  release SKU lock
-```
-
-### Auto-approve
-
-Orders are automatically set to `status: approved` when **both** conditions are met:
-
-| Condition | Value |
+| Condition | Threshold |
 |---|---|
-| Agent confidence | `high` |
-| Total order cost | `< $5,000.00` |
+| Confidence | `high` |
+| Order cost | < $5,000 |
 
-Zero-quantity orders (zero-gap fast path) are always auto-approved regardless of cost.
-
-Orders that do not meet both conditions are routed to human review. `save_order` calls LangGraph's **`interrupt()`**, which serialises the full graph state to the `checkpoints` collection (MongoDBSaver) and pauses the graph. The dashboard detects `status: awaiting_approval`, surfaces the review card, and on button click calls `graph.invoke(Command(resume={"approved": True}))` to reload the checkpoint and continue the graph from where it stopped. The order document carries a `review_reason` field (`"budget_threshold ($X ≥ $5,000 limit)"` or `"confidence=medium"`) shown as a `⚠ REVIEW: <reason>` badge in the dashboard.
-
-> **Teaching moment:** while a graph is paused you can open the `checkpoints` collection in Atlas and see the entire agent state frozen in a single document — suppliers, retrieval trace, recommendation, memories — all serialised by MongoDBSaver.
-
-### Confidence level criteria
-
-| Level | Conditions |
-|---|---|
-| `high` | **ALL of:** ≥5 days remaining · trend stable or decreasing · preferred supplier fill rate ≥95% confirmed by Atlas Search · ≥14 days of consumption history sampled |
-| `medium` | Does not qualify for `high` but no critical flags |
-| `low` | **ANY of:** <2 days remaining · <7 days of history · preferred supplier fill rate <85% · trend unknown · no supplier confirmed by Atlas Search |
-
-### Escalation Policy
-
-An alert is **escalated** (status = `"escalated"`, written to `escalation_queue`) if:
-- A human rejects the same alert **3 or more times** — detected in `_process_one_alert` before the graph runs
-- The **audit agent** reaches max retries (2) without a valid recommendation
-
-Escalated alerts appear in the dashboard "Escalated Alerts" section. An optional `ESCALATION_WEBHOOK_URL` environment variable triggers an HTTP POST on escalation.
-
-### Circuit Breaker
-
-The LLM client tracks consecutive failures. After **3 consecutive failures** the circuit opens:
-- New alerts are written to `human_review_queue` instead of being processed
-- The dashboard sidebar shows a warning banner with a **Reset Circuit Breaker** button (admin only)
-- The circuit resets automatically on the next successful LLM call
+`high` confidence requires: ≥5 days stock remaining, stable/falling trend, preferred supplier fill rate ≥95%, and ≥14 days of consumption history. Anything below that routes to human review.
 
 ---
 
 ## Memory Layers
 
-### Short-term (`short_term_memory`)
-
-One record per `write_memories` run (after auto-approval or after a human decision is received via `interrupt()` resume). Includes `decided_by`, `human_decision`, supplier, quantity, confidence. Rendered in the recommendation agent prompt with visual tags:
-- `⚠ HUMAN REJECTED` — agent must change approach
-- `✓ HUMAN APPROVED` — strong reuse signal
-- `AUTO-APPROVED` — agent's own prior decisions
-
-TTL index auto-purges entries older than 24 h.
-
-### Long-term (`agent_memory`)
-
-Natural-language summaries embedded with Voyage AI `voyage-4-large` (1024 dims). Retrieved via `$vectorSearch` (score ≥ 0.72, location pre-filter). Human override summaries are prefixed distinctly so they surface as separate precedents.
-
-`memory_compactor.py` deduplicates near-duplicate entries (cosine similarity > 0.95) and summarises groups older than 30 days to prevent unbounded growth.
-
-### Procedural (`procedures`)
-
-Candidate rules derived from repeated approval patterns (≥5 approvals of same supplier for same category+location in 30 days). Rules are written with `human_confirmed: false` and must be confirmed via the Admin Panel before the agent uses them.
-
-### Episodic (`alert_lifecycle`)
-
-Full event timeline per alert: `alert_created` → `agent_decision` → `human_approved` / `human_rejected` → `order_placed` → `stock_recovered`. The `get_episode_history` tool surfaces the 3 most recent complete episodes to the recommendation agent.
+| Layer | Collection | How it works |
+|---|---|---|
+| **Short-term** (episodic) | `short_term_memory` | One record per decision; TTL 24h. Tags injected into the next prompt: `⚠ HUMAN REJECTED`, `✓ HUMAN APPROVED`, `AUTO-APPROVED`. Also acts as a shared coordination bus between concurrent workers. |
+| **Long-term** (semantic) | `agent_memory` | Natural-language summaries embedded with Voyage AI `voyage-4-large`. Retrieved via `$vectorSearch` (score ≥ 0.72, location pre-filter). `memory_compactor.py` deduplicates (cosine > 0.95) and summarises entries older than 30 days. |
+| **Semantic precedents** | `order_history` | Full order records with Voyage AI embeddings. Retrieved by `find_similar_past_orders` via `$vectorSearch` (score ≥ 0.78, category pre-filter). |
+| **Procedural** | `procedures` | Rules extracted by `procedure_extractor.py` when the same supplier is approved ≥5× for the same category+location in 30 days. Require human confirmation before the agent uses them. |
+| **Episodic timeline** | `alert_lifecycle` | Full event log per alert: `alert_created → agent_decision → human_approved/rejected → order_placed → stock_recovered`. Surfaced to the agent via `get_episode_history`. |
 
 ---
 
@@ -399,7 +283,7 @@ Aggregation table showing how well predicted confidence (`high`/`medium`/`low`) 
 |---|---|
 | Circuit Breaker status / Reset | Shows failure count; reset button clears the counter and resumes LLM calls |
 | Prepare Context Scenario | Pauses the simulator and creates the deterministic `MED-3017 @ DC-Texas` demo path with live-state, memory, vector-precedent, and procedural-rule context |
-| Extract Rules | Runs `procedure_extractor.py` — scans `short_term_memory` for patterns (same supplier approved ≥5× in 30 days for same category+location) and writes candidate rules to `procedures` |
+| Extract Rules | Runs `procedure_extractor.py` — scans `proposed_orders` for patterns (same supplier approved ≥5× in 30 days for same category+location) and writes candidate rules to `procedures` |
 | Compact Memory | Runs `memory_compactor.py` — deduplicates near-identical `agent_memory` entries (cosine similarity > 0.95) and summarises old entries |
 | Procedure candidate review | Expander listing `procedures` docs where `human_confirmed: False`; per-rule ✅ Confirm and 🗑 Dismiss buttons; confirmed rules are passed to the agent via `get_applicable_procedures` tool |
 | 🔁 Agent Recovery Log | Expander that reads the `checkpoints` collection (LangGraph `MongoDBSaver`), groups by `thread_id` (= alert `_id`), and shows each pipeline run: SKU, location, last node executed, step count, and run outcome (completed ✅ / re-queued 🔄 / escalated 🔺 / recovered mid-pipeline ⚡) |
@@ -409,13 +293,13 @@ Aggregation table showing how well predicted confidence (`high`/`medium`/`low`) 
 When `save_order` determines an order needs human review it calls `interrupt()`. LangGraph writes the full graph state to `checkpoints` (MongoDBSaver) and the graph pauses. The dashboard surfaces the review card.
 
 **Approve:**
-1. Dashboard calls `graph.invoke(Command(resume={"approved": True, "approver": "jsmith"}))`.
+1. Dashboard calls `asyncio.run(_agent_graph.ainvoke(Command(resume={"approved": True, "approver": "jsmith"})))`.
 2. LangGraph reloads the checkpoint, re-enters `save_order` after the `interrupt()` call.
 3. `proposed_orders.status` → `"approved"`; `inventory.on_order` incremented.
 4. Graph continues to `write_memories` — short-term and long-term memory reflect the human approval.
 
 **Reject:**
-1. Dashboard calls `graph.invoke(Command(resume={"approved": False, "reason": "wrong supplier"}))`.
+1. Dashboard calls `asyncio.run(_agent_graph.ainvoke(Command(resume={"approved": False, "reason": "wrong supplier"})))`.
 2. `proposed_orders.status` → `"rejected"`; `rejection_count` on the alert incremented.
 3. Alert resets to `"pending"` — the Change Stream fires again and the agent reprocesses with the rejection visible in short-term memory (`⚠ HUMAN REJECTED` tag).
 4. `write_memories` is still called, writing the rejection to both memory layers as a persistent learning signal.
@@ -606,7 +490,7 @@ Supply_Chain_Reorder_Agent/
 | **FDA regulatory hard filter** | `recommend` calls `validate_recommendation()` in `agent/tools.py` after each LLM call; pharmaceutical and laboratory SKUs are rejected and retried if the supplier does not have `fda_registered: True`; constraint is also stated in `ANALYSIS_SYSTEM_PROMPT` |
 | **ROP health check** | `app.py` aggregates 30-day average consumption from `consumption_history` and best lead time from `suppliers` in two batch queries; each inventory card shows a ✅ / ⚠️ / 🔴 ROP health indicator; a **📐 ROP Health** KPI card counts at-risk SKUs |
 | **LangGraph MongoDBSaver** | Checkpoints full graph state to `checkpoints` per alert invocation; also the pause-point when `interrupt()` fires — open Atlas during a human-review pause to see the entire agent state frozen in one document |
-| **`interrupt()` / `Command(resume=...)`** | LangGraph native HITL primitive used in `save_order`; pauses the graph at the node level; resumed by the dashboard calling `graph.invoke(Command(resume={...}))` with the human's decision |
+| **`interrupt()` / `Command(resume=...)`** | LangGraph native HITL primitive used in `save_order`; pauses the graph at the node level; resumed by the dashboard calling `asyncio.run(_agent_graph.ainvoke(Command(resume={...})))` with the human's decision |
 | **Atomic `findOneAndUpdate`** | Alert claim (pending → processing) prevents two workers racing on the same document |
 
 > **Note on Atlas Stream Processing:** In production, `stream_simulator.py` would be replaced by an Atlas Stream Processing pipeline consuming from Apache Kafka. The agent code is identical regardless — it only sees the `reorder_alerts` collection.
