@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from agent.alerts import build_reorder_alert, insert_reorder_alert
 from agent.logger import get_logger
 from kafka import KafkaConsumer
 from pymongo import MongoClient
@@ -60,10 +61,13 @@ GROUP_ID     = "reorder-alert-group"
 # Helpers  (mirror of stream_simulator.py logic)
 # ---------------------------------------------------------------------------
 
-def get_avg_daily_consumption(sku: str) -> float:
+def get_avg_daily_consumption(sku: str, location: str | None = None) -> float:
     """Aggregate the time series collection to get average daily consumption."""
+    match = {"sku": sku}
+    if location:
+        match["location"] = location
     pipeline = [
-        {"$match": {"sku": sku}},
+        {"$match": match},
         {
             "$group": {
                 "_id": {
@@ -113,7 +117,7 @@ def check_and_alert(sku: str, location: str, quantity: int,
         log.info("stock OK", extra={"sku": sku, "location": location, "on_hand": on_hand})
         return
 
-    avg_daily      = get_avg_daily_consumption(sku)
+    avg_daily      = get_avg_daily_consumption(sku, location)
     days_remaining = round(on_hand / avg_daily, 1) if avg_daily > 0 else 0.0
 
     existing = alerts_collection.find_one(
@@ -125,19 +129,21 @@ def check_and_alert(sku: str, location: str, quantity: int,
         })
         return
 
-    alerts_collection.insert_one({
-        "sku":                        sku,
-        "location":                   location,
-        "on_hand":                    on_hand,
-        "on_order":                   on_order,
-        "reorder_point":              reorder_point,
-        "units_consumed_last_15min":  quantity,
-        "avg_daily_consumption":      avg_daily,
-        "days_of_stock_remaining":    days_remaining,
-        "status":                     "pending",
-        "source":                     "kafka",
-        "created_at":                 datetime.now(timezone.utc),
-    })
+    alert = build_reorder_alert(
+        sku=sku,
+        location=location,
+        on_hand=on_hand,
+        on_order=on_order,
+        reorder_point=reorder_point,
+        units_consumed_last_15min=quantity,
+        avg_daily_consumption=avg_daily,
+        days_of_stock_remaining=days_remaining,
+        source="kafka",
+    )
+    inserted_id = insert_reorder_alert(_db, alert, source="kafka_consumer")
+    if inserted_id is None:
+        log.error("Kafka reorder alert validation failed", extra={"sku": sku, "location": location})
+        return
     log.warning("reorder alert created via Kafka", extra={
         "sku": sku, "location": location,
         "on_hand": on_hand, "days_remaining": days_remaining,

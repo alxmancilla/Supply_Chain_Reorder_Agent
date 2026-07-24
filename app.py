@@ -20,10 +20,9 @@ from dotenv import load_dotenv
 from streamlit_autorefresh import st_autorefresh
 from pymongo import MongoClient
 
-# append_lifecycle_event / write_human_decision_memory are now called from
-# inside the graph (save_and_notify) after interrupt() resumes — not from here.
-from agent.graph import build_graph
-from langgraph.types import Command
+# Human approval side effects live inside agent.graph.save_order. Importing the
+# graph requires LLM credentials, so it is loaded lazily only when a resume or
+# admin circuit-breaker action needs it.
 
 load_dotenv()
 
@@ -35,6 +34,7 @@ load_dotenv()
 _AUTH_CONFIG_PATH = Path(__file__).parent / "auth" / "users.yaml"
 _auth_enabled = _AUTH_CONFIG_PATH.exists()
 _current_role  = "admin"   # default when auth is disabled
+_auth_config_error = None
 
 if _auth_enabled:
     try:
@@ -51,10 +51,7 @@ if _auth_enabled:
             _auth_config["cookie"]["expiry_days"],
         )
     except Exception as _auth_exc:
-        _auth_enabled = False
-        _current_role  = "admin"
-        import warnings
-        warnings.warn(f"Auth config load failed — running unauthenticated: {_auth_exc}")
+        _auth_config_error = _auth_exc
 
 
 def _check_role(required_role: str) -> bool:
@@ -93,7 +90,7 @@ db = get_db()
 # ---------------------------------------------------------------------------
 # Agent graph — shared instance used to resume interrupted (human-review) runs.
 # ---------------------------------------------------------------------------
-# When save_and_notify calls interrupt(), LangGraph saves the full graph state
+# When save_order calls interrupt(), LangGraph saves the full graph state
 # to the `checkpoints` collection via MongoDBSaver.  Calling graph.invoke() with
 # Command(resume=...) here reloads that state and continues the node from the
 # point right after interrupt() returned.
@@ -105,6 +102,7 @@ db = get_db()
 def get_agent_graph():
     """Return a compiled LangGraph instance for resuming interrupted human-review flows."""
     try:
+        from agent.graph import build_graph
         return build_graph()
     except Exception as exc:
         # Non-fatal: the dashboard still works without graph resume capability.
@@ -127,8 +125,10 @@ def _resume_graph(thread_id: str, decision: dict) -> None:
                    {"approved": False, "reason": "wrong supplier"}
     """
     if _agent_graph is None:
-        return   # fallback: graph unavailable, dashboard will do direct writes
+        st.error("Agent graph is unavailable; approve/reject is disabled until graph dependencies and env vars load.")
+        return
     try:
+        from langgraph.types import Command
         # save_order is an async node — must use the async API.
         # asyncio.run() creates a fresh event loop; safe in Streamlit's
         # synchronous script context (no running loop in the script thread).
@@ -176,7 +176,7 @@ if _pending_decision:
         # Resume the paused LangGraph graph with the human's decision.
         #
         # _agent_graph.invoke(Command(resume={...})) reloads the checkpoint that
-        # was written when save_and_notify called interrupt(), re-enters that node
+        # was written when save_order called interrupt(), re-enters that node
         # right after the interrupt() call, and runs the approve/reject logic that
         # lives inside the graph — updating the order status, inventory, memories,
         # and lifecycle events in one place.
@@ -256,6 +256,10 @@ def _delivery_timing(order: dict) -> str:
 # Authentication gate — renders login page when auth is enabled and user is not
 # logged in; sets _current_role for the rest of the script on success.
 # ---------------------------------------------------------------------------
+
+if _auth_config_error is not None:
+    st.error(f"Authentication configuration failed to load: {_auth_config_error}")
+    st.stop()
 
 if _auth_enabled:
     try:
@@ -649,17 +653,20 @@ with st.sidebar:
         st.subheader("🛠 Admin Panel")
 
         # Circuit breaker reset
-        import agent.graph as _agent_graph
-        cb_failures = _agent_graph._get_circuit_failures()
-        cb_open = cb_failures >= _agent_graph._CIRCUIT_THRESHOLD
-        if cb_open:
-            st.warning(f"⚡ Circuit breaker OPEN ({cb_failures} failures)")
-            if st.button("🔌 Reset Circuit Breaker", use_container_width=True):
-                _agent_graph.reset_circuit_breaker()
-                st.success("Circuit breaker reset — LLM calls resumed.")
-                st.rerun()
-        else:
-            st.caption(f"Circuit breaker: 🟢 Closed ({cb_failures}/{_agent_graph._CIRCUIT_THRESHOLD} failures)")
+        try:
+            import agent.graph as _agent_graph_module
+            cb_failures = _agent_graph_module._get_circuit_failures()
+            cb_open = cb_failures >= _agent_graph_module._CIRCUIT_THRESHOLD
+            if cb_open:
+                st.warning(f"⚡ Circuit breaker OPEN ({cb_failures} failures)")
+                if st.button("🔌 Reset Circuit Breaker", use_container_width=True):
+                    _agent_graph_module.reset_circuit_breaker()
+                    st.success("Circuit breaker reset — LLM calls resumed.")
+                    st.rerun()
+            else:
+                st.caption(f"Circuit breaker: 🟢 Closed ({cb_failures}/{_agent_graph_module._CIRCUIT_THRESHOLD} failures)")
+        except Exception as _exc:
+            st.warning(f"Circuit breaker controls unavailable: {_exc}")
 
         # Deterministic context-engineering demo setup
         st.caption("Prepare a deterministic MED-3017 scenario with live state, memory, vector precedent, and policy context.")

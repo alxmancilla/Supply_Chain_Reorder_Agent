@@ -71,7 +71,7 @@ class KafkaInventoryEventSchema(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# LLM recommendation output — validated by the audit agent
+# LLM recommendation output — validated inline by recommend
 # ---------------------------------------------------------------------------
 
 class RecommendationOutputSchema(BaseModel):
@@ -94,7 +94,7 @@ class RecommendationOutputSchema(BaseModel):
 # ---------------------------------------------------------------------------
 
 class DeadLetterEvent(BaseModel):
-    source:     str            # e.g. "kafka_consumer", "change_stream", "audit_agent"
+    source:     str            # e.g. "kafka_consumer", "change_stream", "recommend"
     event_type: str            # e.g. "reorder_alert", "kafka_message", "recommendation"
     raw_payload: dict
     errors:     list[str]

@@ -19,7 +19,7 @@ from pymongo import MongoClient
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from agent.logger import get_logger
-from agent.tools import append_lifecycle_event
+from agent.alerts import build_reorder_alert, insert_reorder_alert, append_lifecycle_event
 
 load_dotenv()
 
@@ -75,10 +75,13 @@ def _set_state(state: str) -> None:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def get_avg_daily_consumption(sku: str) -> float:
+def get_avg_daily_consumption(sku: str, location: str | None = None) -> float:
     """Aggregate the time series collection to get average daily consumption."""
+    match = {"sku": sku}
+    if location:
+        match["location"] = location
     pipeline = [
-        {"$match": {"sku": sku}},
+        {"$match": match},
         {
             "$group": {
                 "_id": {
@@ -115,7 +118,7 @@ def check_and_alert(sku_doc: dict, consumption: int) -> None:
     reorder_point = sku_doc["reorder_point"]
 
     # Persist inventory change
-    inventory.update_one({"sku": sku}, {"$set": {"on_hand": on_hand}})
+    inventory.update_one({"sku": sku, "location": sku_doc["location"]}, {"$set": {"on_hand": on_hand}})
 
     # Record in time series
     record_consumption(sku, sku_doc["location"], consumption)
@@ -123,7 +126,7 @@ def check_and_alert(sku_doc: dict, consumption: int) -> None:
     effective_stock = on_hand + on_order
 
     if effective_stock < reorder_point:
-        avg_daily = get_avg_daily_consumption(sku)
+        avg_daily = get_avg_daily_consumption(sku, sku_doc["location"])
         days_remaining = round(on_hand / avg_daily, 1) if avg_daily > 0 else 0.0
 
         # Skip if an active alert already exists for this SKU + location.
@@ -139,28 +142,21 @@ def check_and_alert(sku_doc: dict, consumption: int) -> None:
             })
             return
 
-        alert = {
-            "sku": sku,
-            "location": sku_doc["location"],
-            "on_hand": on_hand,
-            "on_order": on_order,
-            "reorder_point": reorder_point,
-            "units_consumed_last_15min": consumption,
-            "avg_daily_consumption": avg_daily,
-            "days_of_stock_remaining": days_remaining,
-            "status": "pending",
-            "rejection_count": 0,
-            "created_at": datetime.now(timezone.utc),
-        }
-        alerts_collection.insert_one(alert)
-        append_lifecycle_event(
-            str(alert["_id"]),
-            "alert_created",
-            {"on_hand": on_hand, "days_remaining": days_remaining,
-             "avg_daily": avg_daily, "reorder_point": reorder_point},
-            sku,
-            sku_doc["location"],
+        alert = build_reorder_alert(
+            sku=sku,
+            location=sku_doc["location"],
+            on_hand=on_hand,
+            on_order=on_order,
+            reorder_point=reorder_point,
+            units_consumed_last_15min=consumption,
+            avg_daily_consumption=avg_daily,
+            days_of_stock_remaining=days_remaining,
+            source="simulator",
         )
+        inserted_id = insert_reorder_alert(db, alert, source="simulator")
+        if inserted_id is None:
+            log.error("reorder alert validation failed", extra={"sku": sku, "location": sku_doc["location"]})
+            return
         log.warning("reorder alert created", extra={
             "sku": sku, "location": sku_doc["location"],
             "on_hand": on_hand, "days_remaining": days_remaining,
@@ -183,8 +179,9 @@ def check_and_alert(sku_doc: dict, consumption: int) -> None:
             sort=[("created_at", -1)],
         )
         if recent_alert:
-            avg_daily = get_avg_daily_consumption(sku)
+            avg_daily = get_avg_daily_consumption(sku, sku_doc["location"])
             append_lifecycle_event(
+                db,
                 str(recent_alert["_id"]),
                 "stock_recovered",
                 {"on_hand": on_hand, "avg_daily": avg_daily},
@@ -312,6 +309,7 @@ def deliver_pending_orders() -> None:
         # Append lifecycle event
         if alert_id:
             append_lifecycle_event(
+                db,
                 str(alert_id),
                 "order_delivered",
                 {

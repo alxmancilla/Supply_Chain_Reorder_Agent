@@ -12,6 +12,7 @@ Run once before starting the simulator:
 
 import os
 import random
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -19,6 +20,9 @@ import voyageai
 from dotenv import load_dotenv
 from bson import ObjectId
 from pymongo import MongoClient, ASCENDING
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from agent.alerts import build_reorder_alert, insert_reorder_alert
 
 load_dotenv()
 
@@ -1211,14 +1215,9 @@ def seed_clear_alerts_and_orders() -> None:
 
 
 def seed_initial_alerts() -> None:
-    """Create reorder_alerts for any SKU already below its reorder point at seed time.
-
-    This ensures the agent has work to process immediately after the demo starts,
-    without waiting for the simulator to drain stock further.  The alert schema
-    mirrors what stream_simulator.py produces so the agent processes them identically.
-    """
+    """Create validated reorder_alerts for SKUs below reorder point at seed time."""
     print("Creating initial alerts for below-reorder-point SKUs …")
-    alerts = []
+    inserted = 0
     now = datetime.now(timezone.utc)
     for sku_doc in SKUS:
         sku       = sku_doc["sku"]
@@ -1229,23 +1228,26 @@ def seed_initial_alerts() -> None:
             continue
         avg_daily = AVG_DAILY.get(sku, 1)
         days_remaining = round(on_hand / avg_daily, 1) if avg_daily > 0 else 0.0
-        alerts.append({
-            "sku":                      sku,
-            "location":                 sku_doc["location"],
-            "on_hand":                  on_hand,
-            "on_order":                 on_order,
-            "reorder_point":            reorder,
-            "units_consumed_last_15min": 0,
-            "avg_daily_consumption":    avg_daily,
-            "days_of_stock_remaining":  days_remaining,
-            "status":                   "pending",
-            "created_at":               now,
-        })
-        print(f"  Alert → {sku} @ {sku_doc['location']}: "
-              f"on_hand={on_hand}, reorder_pt={reorder}, days_left={days_remaining}")
-    if alerts:
-        db.reorder_alerts.insert_many(alerts)
-        print(f"  Inserted {len(alerts)} initial alert(s)")
+        alert = build_reorder_alert(
+            sku=sku,
+            location=sku_doc["location"],
+            on_hand=on_hand,
+            on_order=on_order,
+            reorder_point=reorder,
+            units_consumed_last_15min=0,
+            avg_daily_consumption=avg_daily,
+            days_of_stock_remaining=days_remaining,
+            source="seed",
+            created_at=now,
+        )
+        if insert_reorder_alert(db, alert, source="seed") is not None:
+            inserted += 1
+            print(f"  Alert → {sku} @ {sku_doc['location']}: "
+                  f"on_hand={on_hand}, reorder_pt={reorder}, days_left={days_remaining}")
+        else:
+            print(f"  [WARN] Alert validation failed for {sku} @ {sku_doc['location']}")
+    if inserted:
+        print(f"  Inserted {inserted} initial alert(s)")
     else:
         print("  No SKUs below reorder point — no alerts created")
 

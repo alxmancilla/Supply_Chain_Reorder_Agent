@@ -54,13 +54,17 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import create_react_agent  # noqa: F401 — still works; langchain.agents.create_react_agent has a different signature
 from langgraph.types import interrupt, Command  # noqa: F401 — Command re-exported for app.py
 
-from langgraph.checkpoint.mongodb import MongoDBSaver
+try:
+    from langgraph.checkpoint.mongodb import MongoDBSaver
+except ImportError:  # optional in offline unit-test environments
+    MongoDBSaver = None  # type: ignore[assignment]
 
 from agent import sku_lock
 from agent.db import sync_client as _sync_client, db_sync as _db_sync, db_async as _db_async
 from agent.context_manifest import build_context_manifest
 from agent.logger import get_logger
-from agent.schemas import validate_alert, write_dead_letter
+from agent.order_policy import compute_order_decision
+from agent.alerts import validate_alert_document
 from agent.prompts import (
     ANALYSIS_SYSTEM_PROMPT,
     RECOMMENDATION_SYSTEM_PROMPT,
@@ -96,8 +100,7 @@ log = get_logger(__name__)
 # ---------------------------------------------------------------------------
 # Orders at or above this cost always route to human review regardless of
 # confidence level.  A procurement specialist, not the agent, approves high-
-# value orders.  Adjust to match your organisation's authority policy.
-_AUTO_APPROVE_MAX_USD = 5_000.00
+# value orders.  Adjust agent/order_policy.py to change this policy.
 
 # Alerts claimed as processing are recovered on startup if the worker dies before
 # completing the graph. This is intentionally longer than a typical LLM run.
@@ -105,7 +108,7 @@ _STALE_PROCESSING_AFTER_SECONDS = 15 * 60
 
 # Categories that require an FDA-registered wholesale distributor.
 # Selecting a non-FDA supplier for these categories is a hard compliance
-# violation caught by the audit agent.
+# violation caught by inline recommendation validation.
 _FDA_REQUIRED_CATEGORIES = frozenset({"pharmaceutical", "laboratory"})
 
 # ---------------------------------------------------------------------------
@@ -433,8 +436,8 @@ async def assess_alert(state: AgentState) -> AgentState:
 # Node 2: recommend — retrieval → analysis → recommendation → validation
 # ---------------------------------------------------------------------------
 #
-# All four former nodes (retrieval_agent, analysis_agent, recommendation_agent,
-# audit_agent) are merged here so beginners see a single, readable step:
+# Retrieval, analysis, recommendation, and validation are merged here so beginners
+# see a single, readable step:
 #   Step 1 — ReAct tool-calling loop (gather suppliers, trends, memory)
 #   Step 2 — LLM analysis            (rank suppliers, assign confidence)
 #   Step 3 — LLM recommendation      (calculate quantity, write rationale)
@@ -698,51 +701,20 @@ async def save_order(state: AgentState) -> dict:
     alert        = state["alert"]
     coverage_gap = state.get("coverage_gap")
 
-    # ── Build recommendation ─────────────────────────────────────────────────
+    # ── Build recommendation and approval policy ─────────────────────────────
     # Zero-gap fast path: route_by_urgency jumped here without running any LLM.
-    # We synthesise a zero-quantity rec so the rest of the node is uniform.
-    rec = state.get("recommendation") or {}
-    if not rec or coverage_gap == 0:
-        existing = state.get("existing_order_qty", 0)
-        reorder  = state.get("inventory", {}).get("reorder_point", alert.get("reorder_point", 0))
-        on_hand  = state.get("inventory", {}).get("on_hand", alert.get("on_hand", 0))
-        rec = {
-            "supplier_id":   None,
-            "supplier_name": "N/A",
-            "quantity":      0,
-            "rationale":     (
-                f"Existing active orders ({existing} units) plus on-hand stock "
-                f"({on_hand} units) already meet or exceed the reorder point "
-                f"({reorder} units). No additional stock is required."
-            ),
-            "confidence": "high",
-        }
-
-    chosen     = next(
-        (s for s in state.get("suppliers", []) if s.get("supplier_id") == rec.get("supplier_id")),
-        {},
-    )
-    quantity   = rec.get("quantity", 0)
-    unit_price = chosen.get("unit_price", 0.0)
-    lead_time  = chosen.get("lead_time_days", 0)
-    confidence = rec.get("confidence", "medium")
-
-    if coverage_gap is not None and coverage_gap == 0:
-        quantity = 0
-
-    total_cost    = round(quantity * unit_price, 2)
-    zero_order    = quantity == 0 and total_cost == 0.0
-    over_budget   = total_cost >= _AUTO_APPROVE_MAX_USD
-    auto_approved = zero_order or (confidence == "high" and not over_budget)
-
-    if zero_order:
-        review_reason = None
-    elif over_budget:
-        review_reason = f"budget_threshold (${total_cost:,.0f} ≥ ${_AUTO_APPROVE_MAX_USD:,.0f} limit)"
-    elif confidence != "high":
-        review_reason = f"confidence={confidence}"
-    else:
-        review_reason = None
+    # compute_order_decision() synthesises a zero-quantity rec and applies the
+    # same approval policy used by tests and docs.
+    decision = compute_order_decision(state)
+    rec           = decision["recommendation"]
+    quantity      = decision["quantity"]
+    unit_price    = decision["unit_price"]
+    lead_time     = decision["lead_time"]
+    confidence    = decision["confidence"]
+    total_cost    = decision["total_cost"]
+    zero_order    = decision["zero_order"]
+    auto_approved = decision["auto_approved"]
+    review_reason = decision["review_reason"]
 
     clean_similar = [
         {k: v for k, v in o.items() if k != "embedding"}
@@ -1287,7 +1259,7 @@ def route_after_recommend(state: AgentState) -> str:
 #
 # ---------------------------------------------------------------------------
 
-def build_graph():
+def build_graph(checkpointer_required: bool = True):
     builder = StateGraph(AgentState)
 
     builder.add_node("assess_alert",   assess_alert)
@@ -1311,11 +1283,19 @@ def build_graph():
     builder.add_edge("save_order",     "write_memories")
     builder.add_edge("write_memories", END)
 
+    if MongoDBSaver is None:
+        if checkpointer_required:
+            raise RuntimeError(
+                "langgraph-checkpoint-mongodb is required for checkpointed agent runs; "
+                "install dependencies from requirements.txt"
+            )
+        return builder.compile()
+
     checkpointer = MongoDBSaver(_sync_client, db_name="supply_chain_demo")
     return builder.compile(checkpointer=checkpointer)
 
 
-graph = build_graph()
+graph = build_graph(checkpointer_required=MongoDBSaver is not None)
 
 
 # ---------------------------------------------------------------------------
@@ -1543,6 +1523,11 @@ async def _drain_existing_pending_alerts() -> None:
     async for alert_doc in cursor:
         sku = alert_doc.get("sku", "?")
         log.info("startup: processing pre-existing pending alert", extra={"sku": sku})
+        errors = validate_alert_document(_db_sync, alert_doc, "startup_drain")
+        if errors:
+            log.error("startup: pre-existing alert validation failed",
+                      extra={"sku": sku, "errors": errors})
+            continue
         try:
             await _process_one_alert(alert_doc)
             count += 1
@@ -1683,6 +1668,11 @@ async def watch_alerts() -> None:
     ]}}]
     retry_delay = 2
 
+    if MongoDBSaver is None:
+        raise RuntimeError(
+            "langgraph-checkpoint-mongodb is required to run the agent watcher with HITL recovery"
+        )
+
     await sku_lock.ensure_indexes(_db_async)
     log.info("sku_processing_locks indexes ensured")
 
@@ -1711,13 +1701,9 @@ async def watch_alerts() -> None:
                     sku = alert_doc.get("sku", "?")
                     log.info("processing alert", extra={"sku": sku})
 
-                    _, errors = validate_alert(alert_doc)
+                    errors = validate_alert_document(_db_sync, alert_doc, "change_stream")
                     if errors:
                         log.error("alert validation failed", extra={"sku": sku, "errors": errors})
-                        write_dead_letter(
-                            _db_sync, "change_stream", "reorder_alert",
-                            alert_doc, errors,
-                        )
                         continue
 
                     try:

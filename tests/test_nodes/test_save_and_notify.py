@@ -1,86 +1,45 @@
-"""Tests for save_and_notify business logic.
+"""Tests for save_order order-policy behavior.
 
-agent.graph cannot be imported in CI (missing langgraph-checkpoint-mongodb),
-so all logic is tested via pure-function replicas that mirror the exact
-implementation without any external dependencies.
+auto-approval and zero-gap policy is tested via the production
+agent.order_policy module so tests do not drift from save_order behavior.
 """
 
 import pytest
 
 # ---------------------------------------------------------------------------
-# Pure-logic replicas (mirrors save_and_notify without DB / async)
+# Production policy under test
 # ---------------------------------------------------------------------------
 
-AUTO_APPROVE_MAX_COST = 5_000.00
+from agent.order_policy import AUTO_APPROVE_MAX_USD, compute_order_decision
 
 
-def _build_synthetic_zero_rec(state: dict) -> dict:
-    """Mirrors the zero-gap fast-path block in save_and_notify."""
-    alert    = state["alert"]
-    existing = state.get("existing_order_qty", 0)
-    reorder  = state.get("inventory", {}).get("reorder_point", alert.get("reorder_point", 0))
-    on_hand  = state.get("inventory", {}).get("on_hand", alert.get("on_hand", 0))
+def _compute_order(state: dict) -> dict:
+    """Return the order fields produced by production order policy."""
+    decision = compute_order_decision(state)
+    rec = decision["recommendation"]
     return {
-        "supplier_id":   None,
-        "supplier_name": "N/A",
-        "quantity":      0,
-        "rationale":     (
-            f"Existing active orders ({existing} units) plus on-hand stock "
-            f"({on_hand} units) already meet or exceed the reorder point "
-            f"({reorder} units). No additional stock is required."
-        ),
-        "confidence": "high",
+        "supplier_name":        rec.get("supplier_name"),
+        "quantity_recommended": decision["quantity"],
+        "total_cost":           decision["total_cost"],
+        "confidence":           decision["confidence"],
+        "auto_approved":        decision["auto_approved"],
+        "status":               "approved" if decision["auto_approved"] else "awaiting_approval",
+        "review_reason":        decision["review_reason"],
     }
 
 
 def _resolve_rec(state: dict) -> dict:
-    """Returns the effective recommendation, applying zero-gap override if needed."""
-    rec          = state.get("recommendation") or {}
-    coverage_gap = state.get("coverage_gap")
-    if not rec or coverage_gap == 0:
-        rec = _build_synthetic_zero_rec(state)
-    return rec
-
-
-def _compute_order(state: dict) -> dict:
-    """Mirrors the auto-approve and quantity-override logic in save_and_notify."""
-    rec          = _resolve_rec(state)
-    coverage_gap = state.get("coverage_gap")
-    suppliers    = state.get("suppliers", [])
-
-    chosen     = next((s for s in suppliers if s.get("supplier_id") == rec.get("supplier_id")), {})
-    quantity   = rec.get("quantity", 0)
-    unit_price = chosen.get("unit_price", 0.0)
-    confidence = rec.get("confidence", "medium")
-
-    # Safety override
-    if coverage_gap is not None and coverage_gap == 0:
-        quantity = 0
-
-    total_cost    = round(quantity * unit_price, 2)
-    zero_order    = quantity == 0 and total_cost == 0.0
-    auto_approved = zero_order or (confidence == "high" and total_cost < AUTO_APPROVE_MAX_COST)
-    status        = "approved" if auto_approved else "awaiting_approval"
-
-    return {
-        "supplier_name":        rec.get("supplier_name"),
-        "quantity_recommended": quantity,
-        "total_cost":           total_cost,
-        "confidence":           confidence,
-        "auto_approved":        auto_approved,
-        "status":               status,
-    }
+    return compute_order_decision(state)["recommendation"]
 
 
 def _approval_side_effects(current_order_status: str, inventory_applied: bool = False) -> dict:
-    """Pure replica of idempotent human approval side-effect gating."""
+    """Pure replica of the DB idempotency gate around approval side effects."""
     transitioned = current_order_status in ("awaiting_approval", "approved") and not inventory_applied
     return {
         "order_status": "approved" if transitioned or current_order_status == "approved" else current_order_status,
         "increment_inventory": transitioned,
         "append_lifecycle": transitioned,
     }
-
 
 # ---------------------------------------------------------------------------
 # Helpers

@@ -1,19 +1,19 @@
-"""Tests for audit_agent validation logic and route_after_audit routing."""
-
-import asyncio
-from unittest.mock import patch
-
-import pytest
+"""Tests for current inline recommendation validation."""
 
 from agent.tools import validate_recommendation
 
 
 class TestValidateRecommendation:
-    def _state(self, gap=155):
+    def _state(self, gap=155, category="surgical", fda_registered=True):
         return {
             "coverage_gap": gap,
+            "inventory": {"category": category},
             "suppliers": [
-                {"supplier_id": "SUP-001", "supplier_name": "MedSupply Co", "fda_registered": True},
+                {
+                    "supplier_id": "SUP-001",
+                    "supplier_name": "MedSupply Co",
+                    "fda_registered": fda_registered,
+                },
             ],
         }
 
@@ -104,29 +104,15 @@ class TestValidateRecommendation:
         errors = validate_recommendation(rec, self._state())
         assert any("Unknown supplier_id" in e for e in errors)
 
-
-def _route_after_audit(state: dict) -> str:
-    """Pure replica of agent.graph.route_after_audit for unit testing without
-    importing the full graph module (which requires langgraph-checkpoint-mongodb)."""
-    if state.get("audit_result", {}).get("valid"):
-        return "save_and_notify"
-    if state.get("audit_retries", 0) >= 2:
-        return "escalate"
-    return "recommendation_agent"
-
-
-class TestRouteAfterAudit:
-    def test_valid_routes_to_save(self):
-        state = {"audit_result": {"valid": True, "errors": []}, "audit_retries": 0,
-                 "alert": {"sku": "MED-3017"}}
-        assert _route_after_audit(state) == "save_and_notify"
-
-    def test_invalid_first_retry_routes_to_recommendation(self):
-        state = {"audit_result": {"valid": False, "errors": ["bad"]}, "audit_retries": 1,
-                 "alert": {"sku": "MED-3017"}}
-        assert _route_after_audit(state) == "recommendation_agent"
-
-    def test_invalid_max_retries_routes_to_escalate(self):
-        state = {"audit_result": {"valid": False, "errors": ["bad"]}, "audit_retries": 2,
-                 "alert": {"sku": "MED-3017"}}
-        assert _route_after_audit(state) == "escalate"
+    def test_non_fda_supplier_rejected_for_pharmaceutical(self):
+        rec = {
+            "supplier_id":   "SUP-001",
+            "supplier_name": "MedSupply Co",
+            "quantity":      100,
+            "rationale":     "Ordering from the only listed supplier for this medication.",
+            "confidence":    "medium",
+        }
+        errors = validate_recommendation(
+            rec, self._state(category="pharmaceutical", fda_registered=False)
+        )
+        assert any("FDA-registered" in e for e in errors)

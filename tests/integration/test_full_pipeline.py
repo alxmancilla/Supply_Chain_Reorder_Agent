@@ -28,12 +28,12 @@ pytestmark = requires_db
 try:
     from agent.graph import graph as _graph, _serialize_doc as _sd
     _GRAPH_AVAILABLE = True
-except ImportError:
+except Exception:
     _GRAPH_AVAILABLE = False
 
 requires_graph = pytest.mark.skipif(
     not _GRAPH_AVAILABLE,
-    reason="langgraph-checkpoint-mongodb not installed — run inside Docker to exercise these tests",
+    reason="graph dependencies or environment variables unavailable — run inside Docker to exercise these tests",
 )
 
 

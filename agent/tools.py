@@ -676,7 +676,7 @@ def get_learned_patterns(situation_description: str, location: str | None = None
 
 
 # ---------------------------------------------------------------------------
-# Recommendation validator — called by the audit_agent node (not an @tool)
+# Recommendation validator — called inline by the recommend node (not an @tool)
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -773,7 +773,7 @@ def get_episode_history(sku: str, location: str, limit: int = 3) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Recommendation validator (called by audit_agent node, not an @tool)
+# Recommendation validator (called by recommend node, not an @tool)
 # ---------------------------------------------------------------------------
 
 def validate_recommendation(rec: dict, state: dict) -> list:

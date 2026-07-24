@@ -2,9 +2,9 @@
 
 An AI agent that monitors healthcare inventory in real time, detects stockouts, and autonomously drafts purchase orders — with human approval for anything above the auto-approve threshold.
 
-**Stack:** MongoDB Atlas · LangGraph · LangChain · GPT-4o · Voyage AI
+**Stack:** MongoDB Atlas · LangGraph · LangChain · Grove OpenAI-compatible LLM · Voyage AI
 
-> **Demo project.** All inventory data is simulated. Designed to showcase MongoDB Atlas capabilities in an agentic workflow.
+> **Demo project.** All inventory data is simulated. Designed to showcase MongoDB Atlas capabilities in an agentic workflow. Production-hardening sections demonstrate patterns, not a complete production procurement system.
 
 ---
 
@@ -22,11 +22,11 @@ The simulator writes a reorder alert whenever stock falls below the reorder poin
 |---|---|
 | `assess_alert` | Reads live inventory; calculates coverage gap and urgency |
 | `route_by_urgency` | Zero-gap alerts skip the LLM; all others go to `recommend` |
-| `recommend` | ReAct loop: queries Atlas Search, Vector Search, time-series trend, and memory — then calls GPT-4o to pick a supplier, quantity, and rationale |
+| `recommend` | ReAct loop: queries Atlas Search, Vector Search, time-series trend, and memory — then calls the configured Grove-hosted model to pick a supplier, quantity, and rationale |
 | `save_order` | Writes the order. **Auto-approves** if confidence is `high` and cost < $5,000; otherwise pauses for human review via LangGraph `interrupt()` |
 | `write_memories` | Persists the decision to short-term memory (TTL 24h), long-term semantic memory, and order history |
 
-Full diagrams: [WORKFLOW.md](WORKFLOW.md) · [DASHBOARD_ARCHITECTURE.md](DASHBOARD_ARCHITECTURE.md)
+Full diagrams: [diagrams/agent_diagrams.md](diagrams/agent_diagrams.md)
 
 ### Human-in-the-Loop
 
@@ -91,7 +91,7 @@ When an order needs review, `save_order` calls `interrupt()` — LangGraph seria
 - [Docker Desktop](https://www.docker.com/products/docker-desktop/) (recommended)
   _or_ Python 3.12+ with a virtual environment
 - [MongoDB Atlas](https://www.mongodb.com/atlas) cluster (M0 free tier works; Atlas Search and Vector Search must be enabled)
-- Grove API key + base URL (Azure OpenAI gateway providing GPT-4o)
+- Grove API key + base URL (OpenAI-compatible gateway; code defaults to `gpt-5.4`)
 - [Voyage AI](https://www.voyageai.com) API key (for `voyage-4-large` embeddings)
 
 ---
@@ -144,7 +144,7 @@ Edit `auth/users.yaml` with hashed credentials. When `auth/users.yaml` is presen
 | `approver` | All above + approve/reject orders |
 | `admin` | All above + Admin Panel (Extract Rules, Compact Memory, reset circuit breaker) |
 
-If `auth/users.yaml` is absent, the dashboard runs unauthenticated with full admin access (demo mode).
+If `auth/users.yaml` is absent, the dashboard runs unauthenticated with full admin access (demo mode). If the file is present but invalid, the dashboard fails closed instead of granting admin access.
 
 ### 4. Seed MongoDB
 
@@ -314,7 +314,7 @@ When `save_order` determines an order needs human review it calls `interrupt()`.
 All system boundaries validate incoming data with `agent/schemas.py`:
 - `ReorderAlertSchema` — validates alert documents before graph invocation
 - `KafkaInventoryEventSchema` — validates Kafka messages in `consumer.py`
-- `RecommendationOutputSchema` — used by the audit agent
+- `RecommendationOutputSchema` — schema reference for recommendation validation
 
 Validation failures are written to `dead_letter_events` and logged at ERROR level.
 
@@ -348,7 +348,7 @@ python3 -m pytest tests/ -v
 
 Tests that require a live MongoDB Atlas connection are automatically skipped when the cluster is unreachable (`requires_db` marker). All other tests run without any external dependencies.
 
-Current local baseline after the demo smoke test: `90 passed, 2 skipped`. Skips are expected when the full graph integration dependencies are not importable in the local Python environment; run inside the Docker image/full dependency environment to exercise those paths.
+Current local baseline in this workspace: `72 passed, 23 skipped` after adding offline graph and alert-helper coverage. Skips are expected when MongoDB Atlas is unreachable; live DB integration tests run when `MONGODB_URI` points to a reachable cluster.
 
 ```bash
 # Only offline unit tests (no DB, no LLM)
@@ -363,8 +363,8 @@ python3 -m pytest tests/test_coordination/ -v
 | Module | Location | What is tested |
 |---|---|---|
 | Coverage gap logic | `test_nodes/test_assess_alert.py` | Gap calculation, expedite flag, boundary conditions |
-| Auto-approve thresholds | `test_nodes/test_save_and_notify.py` | High-confidence auto-approval, zero-gap path, cost threshold, human-review side-effect idempotency |
-| Audit validation | `test_nodes/test_audit_agent.py` | Validation rules, retry routing, escalation route |
+| Auto-approve thresholds | `test_nodes/test_save_and_notify.py` | Production `agent.order_policy` behavior for high-confidence approval, zero-gap path, cost threshold, and approval idempotency gate |
+| Inline validation | `test_nodes/test_audit_agent.py` | Recommendation validation rules, including supplier allow-list and FDA hard filter |
 | Consumption trend | `test_tools/test_consumption_trend.py` | Avg daily calculation, trend direction |
 | Memory read/write | `test_tools/test_memory_read_write.py` | Short-term insert, read, TTL filtering |
 | Memory payloads | `test_tools/test_memory_payloads.py` | Human rejection fields persisted for future context |
@@ -372,6 +372,8 @@ python3 -m pytest tests/test_coordination/ -v
 | Context budget | `test_tools/test_context_budget.py` | Token counting, trim priority order |
 | Prompt rendering | `test_prompts/test_build_prompt.py`, `test_memory_tags.py` | Tag formatting, prompt structure |
 | SKU lock | `test_coordination/test_sku_lock.py` | Acquire/release logic, expired-lock cleanup, concurrent exclusivity (real DB) |
+| Offline graph path | `test_nodes/test_graph_offline.py` | Compiles the real topology without MongoDBSaver and verifies zero-gap routing skips recommendation |
+| Alert helpers | `test_tools/test_alert_helpers.py` | Canonical alert shape, lifecycle append, dead-letter behavior |
 | End-to-end pipeline | `integration/test_full_pipeline.py` | Insert alert → graph → assert proposed_order saved (requires MongoDB and graph dependencies) |
 
 ### Coordination tests in detail
@@ -407,9 +409,9 @@ Supply_Chain_Reorder_Agent/
 ├── .env.example
 ├── requirements.txt
 ├── README.md
-├── DASHBOARD_ARCHITECTURE.md        # Mermaid data-flow diagram (simulator → Atlas → agent → dashboard)
-├── WORKFLOW.md                      # node-by-node agent diagrams (system flow + agent cards + state schema)
 ├── DEMO_SCRIPT.md                   # 5-minute demo walkthrough with talking points
+├── diagrams/
+│   └── agent_diagrams.md            # workflow and dashboard architecture diagrams
 ├── auth/
 │   └── users.yaml.example           # copy to users.yaml and fill credentials
 ├── data/
@@ -434,14 +436,16 @@ Supply_Chain_Reorder_Agent/
 │   ├── conftest.py                  # fixtures: test_db, mock LLM, mock Voyage AI
 │   ├── test_nodes/
 │   │   ├── test_assess_alert.py     # coverage gap + expedite logic
-│   │   ├── test_save_and_notify.py  # auto-approve thresholds, zero-gap path, approval idempotency
-│   │   └── test_audit_agent.py      # validation rules, retry routing, escalation route
+│   │   ├── test_save_and_notify.py  # production order-policy tests
+│   │   ├── test_audit_agent.py      # inline recommendation validation
+│   │   └── test_graph_offline.py    # mocked graph topology path without Atlas
 │   ├── test_tools/
 │   │   ├── test_consumption_trend.py
 │   │   ├── test_context_budget.py
 │   │   ├── test_context_manifest.py
 │   │   ├── test_memory_payloads.py
-│   │   └── test_memory_read_write.py
+│   │   ├── test_memory_read_write.py
+│   │   └── test_alert_helpers.py
 │   ├── test_prompts/
 │   │   ├── test_build_prompt.py
 │   │   └── test_memory_tags.py

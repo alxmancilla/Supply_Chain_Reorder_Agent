@@ -4,11 +4,11 @@ LLM prompt templates for the multi-agent reorder pipeline.
 Agents and their prompts:
   retrieval_agent      → RETRIEVAL_SYSTEM_PROMPT   (ReAct tool-calling loop)
   analysis_agent       → ANALYSIS_SYSTEM_PROMPT    (supplier eval + confidence)
-  recommendation_agent → RECOMMENDATION_SYSTEM_PROMPT (quantity + rationale)
+  recommendation step → RECOMMENDATION_SYSTEM_PROMPT (quantity + rationale)
 
 Prompt builders:
   build_analysis_prompt(state)        → user prompt for analysis_agent
-  build_recommendation_prompt(state)  → user prompt for recommendation_agent
+  build_recommendation_prompt(state)  → user prompt for recommendation generation
 """
 
 # ---------------------------------------------------------------------------
@@ -88,7 +88,7 @@ REGULATORY HARD CONSTRAINT (non-negotiable):
     suppliers where fda_registered=True.
   - If fda_registered=False, that supplier is ineligible regardless of price or lead time.
   - Selecting a non-FDA-registered supplier for these categories will be rejected by the
-    audit agent and require a retry. Do not select such a supplier under any circumstance.
+    inline validator and require a retry. Do not select such a supplier under any circumstance.
 
 Do NOT calculate order quantities. Do NOT write rationale for the human approver.
 Return ONLY the JSON object — no markdown fences, no extra keys, no text outside the JSON.
@@ -248,7 +248,7 @@ Focus on: supplier reliability, urgency level, historical outcomes, and memory s
 
 
 # ---------------------------------------------------------------------------
-# build_recommendation_prompt — user message for recommendation_agent
+# build_recommendation_prompt — user message for recommendation generation
 # ---------------------------------------------------------------------------
 
 def build_recommendation_prompt(state: dict) -> str:
