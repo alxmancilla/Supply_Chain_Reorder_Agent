@@ -41,17 +41,33 @@ import asyncio
 import json
 import os
 import sys
+import warnings
 from datetime import datetime, timedelta, timezone
 from typing import TypedDict
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# langgraph's internal BaseCache/BaseCheckpointSaver classes instantiate
+# JsonPlusSerializer(pickle_fallback=True) at class-definition time without
+# passing `allowed_objects`, which trips a pending-deprecation warning on
+# every import of langgraph.graph / langgraph.checkpoint.*. This is emitted
+# from inside the library (not a call site we control), so it is filtered
+# here rather than left to spam the logs. Safe to remove once langgraph
+# passes an explicit `allowed_objects` internally.
+from langchain_core._api.deprecation import LangChainPendingDeprecationWarning
+
+warnings.filterwarnings(
+    "ignore",
+    category=LangChainPendingDeprecationWarning,
+    message=r"The default value of `allowed_objects` will change",
+)
+
 from bson import ObjectId
 from dotenv import load_dotenv
+from langchain.agents import create_agent
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
-from langgraph.prebuilt import create_react_agent  # noqa: F401 — still works; langchain.agents.create_react_agent has a different signature
 from langgraph.types import interrupt, Command  # noqa: F401 — Command re-exported for app.py
 
 try:
@@ -247,7 +263,7 @@ async def _llm_invoke(messages: list) -> object:
             raise fallback_exc
 
 
-# Keep the bare `llm` name for the ReAct agent (create_react_agent requires it at init time)
+# Keep the bare `llm` name for the ReAct agent (create_agent requires it at init time)
 llm = _llm_primary
 
 # ---------------------------------------------------------------------------
@@ -265,7 +281,10 @@ _RETRIEVAL_TOOLS = [
     get_applicable_procedures,
 ]
 
-_retrieval_react_agent = create_react_agent(llm, _RETRIEVAL_TOOLS)
+# langgraph.prebuilt.create_react_agent was moved to langchain.agents.create_agent
+# in LangGraph v1.0 (removal planned for v2.0). Same resulting CompiledStateGraph
+# interface (.ainvoke with {"messages": [...]}), so no other call sites change.
+_retrieval_react_agent = create_agent(llm, _RETRIEVAL_TOOLS)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1284,13 +1303,14 @@ def build_graph(checkpointer_required: bool = True):
     builder.add_edge("save_order",     "write_memories")
     builder.add_edge("write_memories", END)
 
-    if MongoDBSaver is None:
-        if checkpointer_required:
-            raise RuntimeError(
-                "langgraph-checkpoint-mongodb is required for checkpointed agent runs; "
-                "install dependencies from requirements.txt"
-            )
+    if not checkpointer_required:
         return builder.compile()
+
+    if MongoDBSaver is None:
+        raise RuntimeError(
+            "langgraph-checkpoint-mongodb is required for checkpointed agent runs; "
+            "install dependencies from requirements.txt"
+        )
 
     checkpointer = MongoDBSaver(_sync_client, db_name="supply_chain_demo")
     return builder.compile(checkpointer=checkpointer)
@@ -1680,9 +1700,6 @@ async def watch_alerts() -> None:
 
     _assert_vector_index_dims()
 
-    await _recover_stale_processing_alerts()
-    await _drain_existing_pending_alerts()
-
     while True:
         resume_token = _load_resume_token()
         watch_kwargs = dict(full_document="updateLookup")
@@ -1693,6 +1710,22 @@ async def watch_alerts() -> None:
         try:
             async with _db_async.reorder_alerts.watch(pipeline, **watch_kwargs) as stream:
                 retry_delay = 2
+
+                # Drain pre-existing pending alerts AFTER the Change Stream
+                # cursor is open, not before. _drain_existing_pending_alerts()
+                # can take tens of seconds (each paused/awaiting-review alert
+                # still runs an LLM call). If a human approves/rejects one of
+                # those alerts *during* the drain, the reject path resets the
+                # alert's status back to "pending" — a change stream is the
+                # only thing that will ever pick that back up. Draining before
+                # the cursor opens means that update lands in a dead window:
+                # the drain's find() snapshot was already taken (so it won't
+                # rescan) and the stream wasn't listening yet (so the event is
+                # lost forever). Opening the cursor first means any such
+                # update is buffered by the stream and delivered by the loop
+                # below right after the drain finishes.
+                await _recover_stale_processing_alerts()
+                await _drain_existing_pending_alerts()
                 async for change in stream:
                     _save_resume_token(change["_id"])
 
@@ -1715,14 +1748,36 @@ async def watch_alerts() -> None:
 
         except Exception as exc:  # noqa: BLE001
             err_type = type(exc).__name__
+            err_code = getattr(exc, "code", None)
             log.error("Change Stream interrupted, reconnecting", extra={
                 "error_type":  err_type,
+                "error_code":  err_code,
                 "error":       str(exc),
                 "retry_delay": retry_delay,
             })
             await asyncio.sleep(retry_delay)
             retry_delay = min(retry_delay * 2, 30)
-            if "InvalidateError" in err_type or "CursorNotFound" in err_type:
+            # A saved resume token becomes permanently unusable when: the
+            # cursor is gone (CursorNotFound), the stream was invalidated
+            # (InvalidateError — collection dropped/renamed), the server
+            # rejects resuming from an invalidate notification (OperationFailure
+            # code 260, InvalidResumeToken — the actual error seen in
+            # production after a "Demo Reset" collection drop raced with this
+            # reconnect), or the oplog window expired before we resumed
+            # (ChangeStreamHistoryLost, code 286). Any of these previously
+            # fell through uncleared, so the watcher looped forever retrying
+            # the exact same dead token every ≤30s instead of restarting the
+            # stream from the current head. Match on error code (stable
+            # across server versions) with a message-text fallback for
+            # drivers/servers that surface it without a code.
+            _STALE_TOKEN_CODES = {260, 286}
+            is_stale_token = (
+                "InvalidateError" in err_type
+                or "CursorNotFound" in err_type
+                or err_code in _STALE_TOKEN_CODES
+                or "resume" in str(exc).lower() and "invalidate" in str(exc).lower()
+            )
+            if is_stale_token:
                 _db_sync[_AGENT_STATE_COLLECTION].delete_one({"_id": _RESUME_TOKEN_DOC_ID})
                 log.info("cleared stale resume token, stream will start fresh")
 

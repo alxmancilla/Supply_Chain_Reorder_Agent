@@ -10,6 +10,7 @@ Layout:
 
 import asyncio
 import os
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -114,6 +115,25 @@ def get_agent_graph():
 _agent_graph = get_agent_graph()
 
 
+# ---------------------------------------------------------------------------
+# Persistent event loop for resuming interrupted graph runs.
+# ---------------------------------------------------------------------------
+# agent/graph.py's save_order/write_memories nodes use the module-level Motor
+# (AsyncIOMotorClient) singleton from agent/db.py. Motor binds that client's
+# internal locks/sockets to whichever event loop first runs a query on it.
+# asyncio.run() creates AND closes a brand-new loop on every call — so the
+# first approve/reject click works, but every subsequent one raises
+# "Event loop is closed" because the shared Motor client is still bound to
+# the first (now-destroyed) loop. Keeping one loop alive for the life of the
+# process — reused via run_until_complete() — avoids that.
+_resume_loop_lock = threading.Lock()
+
+
+@st.cache_resource
+def _get_resume_loop() -> asyncio.AbstractEventLoop:
+    return asyncio.new_event_loop()
+
+
 def _resume_graph(thread_id: str, decision: dict) -> None:
     """Resume a paused graph with a human decision.
 
@@ -129,15 +149,17 @@ def _resume_graph(thread_id: str, decision: dict) -> None:
         return
     try:
         from langgraph.types import Command
-        # save_order is an async node — must use the async API.
-        # asyncio.run() creates a fresh event loop; safe in Streamlit's
-        # synchronous script context (no running loop in the script thread).
-        asyncio.run(
-            _agent_graph.ainvoke(
-                Command(resume=decision),
-                config={"configurable": {"thread_id": thread_id}},
+        # save_order is an async node — must use the async API. Reuse a single
+        # long-lived event loop (see _get_resume_loop) instead of asyncio.run()
+        # so the shared Motor client's loop-bound state stays valid across calls.
+        loop = _get_resume_loop()
+        with _resume_loop_lock:
+            loop.run_until_complete(
+                _agent_graph.ainvoke(
+                    Command(resume=decision),
+                    config={"configurable": {"thread_id": thread_id}},
+                )
             )
-        )
     except Exception as exc:
         # Log but don't crash the dashboard — the approve/reject write in session
         # state already updated proposed_orders; memories are the only missing piece.
@@ -780,14 +802,13 @@ with st.sidebar:
             with st.expander(f"📋 {len(_pending_rules)} candidate rule(s) awaiting confirmation", expanded=True):
                 st.caption("Rules are only passed to the agent after you confirm them.")
                 for _rule in _pending_rules:
-                    _rc, _rb = st.columns([5, 2])
+                    _rc, _rb1, _rb2 = st.columns([5, 1, 1])
                     _rc.markdown(
                         f"**{_rule['sku_category']}** @ `{_rule['location']}`  →  "
                         f"**{_rule['preferred_supplier_name']}**  "
                         f"*(ID: {_rule['preferred_supplier_id']}, "
                         f"{_rule['evidence_count']} approvals)*"
                     )
-                    _rb1, _rb2 = _rb.columns(2)
                     _rule_id_str = str(_rule["_id"])
                     if _rb1.button("✅", key=f"confirm_rule_{_rule_id_str}",
                                    help="Confirm — agent will use this rule",
