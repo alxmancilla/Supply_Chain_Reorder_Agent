@@ -5,7 +5,8 @@ Fixture summary
 ───────────────
 test_db         — isolated MongoDB database on the same cluster; dropped at end of session
 mock_llm        — deterministic LLM returning canned JSON keyed by phase/content
-mock_voyage     — zero-vector embeddings; tests structure not semantics
+mock_embeddings — zero-vector embeddings (agent.embeddings.Embeddings interface);
+                  tests structure not semantics
 sample_alert    — minimal valid reorder_alert document
 sample_state    — minimal AgentState with alert, inventory, suppliers, etc.
 """
@@ -140,23 +141,40 @@ def mock_llm():
 
 
 # ---------------------------------------------------------------------------
-# Mock Voyage AI — returns zero-vector embeddings (1024 dims)
+# Mock embedding provider — returns zero-vector embeddings (1024 dims),
+# matching the agent.embeddings.Embeddings interface (embed_query/embed_documents)
+# so it can be dropped in for agent.embeddings.embeddings via patch().
 # ---------------------------------------------------------------------------
 
 _ZERO_EMBEDDING = [0.0] * 1024
 
 
-class _MockVoyage:
-    class _Result:
-        embeddings = [_ZERO_EMBEDDING]
+class _MockEmbeddings:
+    def embed_query(self, text: str) -> list:
+        return _ZERO_EMBEDDING
 
-    def embed(self, texts, model=None, input_type=None):
-        return self._Result()
+    def embed_documents(self, texts: list) -> list:
+        return [_ZERO_EMBEDDING for _ in texts]
 
 
 @pytest.fixture
-def mock_voyage():
-    return _MockVoyage()
+def mock_embeddings():
+    return _MockEmbeddings()
+
+
+# ---------------------------------------------------------------------------
+# Mock reranking provider — respects top_k but does no scoring.
+# Sized to match agent.rerank.Reranker protocol.
+# ---------------------------------------------------------------------------
+
+class _MockReranker:
+    def rerank(self, query: str, documents: list, text_key: str, top_k: int = 3) -> list:
+        return documents[:top_k]
+
+
+@pytest.fixture
+def mock_reranker():
+    return _MockReranker()
 
 
 # ---------------------------------------------------------------------------

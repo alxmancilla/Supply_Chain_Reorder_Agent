@@ -22,6 +22,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dotenv import load_dotenv
 from pymongo import MongoClient
 
+from agent.embeddings import embeddings as _embeddings
+
 load_dotenv()
 
 _client = MongoClient(
@@ -53,17 +55,15 @@ def _retry_short_term(payload: dict) -> None:
 
 
 def _retry_long_term(payload: dict) -> None:
-    """Retry a failed long_term_memory (agent_memory) write — re-embeds content."""
-    import voyageai
+    """Retry a failed long_term_memory (agent_memory) write — re-embeds content
+    via the configured embedding provider (agent/embeddings.py)."""
     from datetime import datetime as _dt
 
-    voyage  = voyageai.Client(api_key=os.environ["VOYAGE_API_KEY"])
     content = payload.get("content", "")
     if not content:
         raise ValueError("payload has no 'content' field — cannot embed")
 
-    result    = voyage.embed([content], model="voyage-4-large", input_type="document")
-    embedding = result.embeddings[0]
+    embedding = _embeddings.embed_documents([content])[0]
 
     created_at_raw = payload.get("created_at")
     if isinstance(created_at_raw, str):

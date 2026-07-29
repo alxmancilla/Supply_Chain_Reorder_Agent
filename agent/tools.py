@@ -10,16 +10,16 @@ Tools:
 """
 
 import os
-import time
 from datetime import datetime, timedelta, timezone
 
 from bson import ObjectId
-import voyageai
 from dotenv import load_dotenv
 from langchain_core.tools import tool
 
 from agent.db import db_sync as _db
+from agent.embeddings import embeddings as _embeddings
 from agent.logger import get_logger
+from agent.rerank import reranker as _reranker
 
 load_dotenv()
 
@@ -29,39 +29,27 @@ log = get_logger(__name__)
 _GROVE_API_KEY  = os.environ["GROVE_API_KEY"]
 _GROVE_BASE_URL = os.environ["GROVE_API_BASE_URL"]
 
-# Voyage AI embedding client
-_voyage = voyageai.Client(api_key=os.environ["VOYAGE_API_KEY"])
-_EMBEDDING_MODEL = "voyage-4-large"
-
 
 def _get_embedding(text: str, max_retries: int = 3, input_type: str = "query") -> list:
-    """Embed a text string with Voyage AI voyage-4-large.
+    """Embed a text string via the configured embedding provider (agent/embeddings.py).
 
-    Retries up to max_retries times with exponential back-off (1 s → 2 s → 4 s)
-    so transient Voyage AI errors don't cause vector search tools to fail silently.
+    input_type selects the provider's query-side vs document-side embedding
+    mode (a Voyage AI optimization); providers without that concept can
+    ignore it. Retries are handled inside the embedding provider itself, so
+    max_retries is kept only for backward-compatible call signatures.
     """
-    for attempt in range(max_retries):
-        try:
-            result = _voyage.embed([text], model=_EMBEDDING_MODEL, input_type=input_type)
-            return result.embeddings[0]
-        except Exception as exc:
-            if attempt < max_retries - 1:
-                wait = 2 ** attempt
-                log.warning("embedding attempt failed, retrying", extra={
-                    "attempt": attempt + 1, "wait_s": wait, "error": str(exc),
-                })
-                time.sleep(wait)
-            else:
-                raise
+    if input_type == "document":
+        return _embeddings.embed_documents([text])[0]
+    return _embeddings.embed_query(text)
 
 
 def _get_query_embedding(text: str, max_retries: int = 3) -> list:
-    """Embed retrieval queries with Voyage's query-side embedding mode."""
+    """Embed retrieval queries with the provider's query-side embedding mode."""
     return _get_embedding(text, max_retries=max_retries, input_type="query")
 
 
 def _get_document_embedding(text: str, max_retries: int = 3) -> list:
-    """Embed persisted memories/orders with Voyage's document-side embedding mode."""
+    """Embed persisted memories/orders with the provider's document-side embedding mode."""
     return _get_embedding(text, max_retries=max_retries, input_type="document")
 
 
@@ -307,7 +295,7 @@ def find_similar_past_orders(
     except Exception as exc:
         return [{"error": f"Embedding generation failed: {exc}"}]
 
-    # Over-fetch so the score filter doesn't exhaust the candidate pool.
+    # Over-fetch so the score filter and reranker don't exhaust the candidate pool.
     fetch_limit = limit + 10
 
     vector_search_stage: dict = {
@@ -328,7 +316,7 @@ def find_similar_past_orders(
         {"$addFields": {"similarity_score": {"$meta": "vectorSearchScore"}}},
         # Drop orders below the similarity threshold
         {"$match": {"similarity_score": {"$gte": min_score}}},
-        {"$limit": limit},
+        {"$limit": fetch_limit},
         {
             "$project": {
                 "_id":                    0,
@@ -346,11 +334,21 @@ def find_similar_past_orders(
     ]
 
     try:
-        results = list(_db.order_history.aggregate(pipeline))
+        agg_res = _db.order_history.aggregate(pipeline)
+        results = list(agg_res)
     except Exception as exc:
         return [{"error": f"Vector Search unavailable: {exc}"}]
 
-    return results if results else [{"info": "No similar past orders found above similarity threshold"}]
+    if not results:
+        return [{"info": "No similar past orders found above similarity threshold"}]
+
+    # Rerank candidates to pick the best limit=N (uses Voyage Rerank if enabled)
+    return _reranker.rerank(
+        query=situation_text,
+        documents=results,
+        text_key="rationale",
+        top_k=limit,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -441,7 +439,7 @@ def get_long_term_memories(
 ) -> list:
     """
     Vector search on agent_memory: retrieve the most relevant past learnings
-    for the current situation using Voyage AI embeddings.
+    for the current situation using the configured embedding provider.
     The collection grows as the agent makes decisions — empty on first run.
     """
     try:
@@ -466,7 +464,7 @@ def get_long_term_memories(
         },
         {"$addFields": {"memory_score": {"$meta": "vectorSearchScore"}}},
         {"$match": {"memory_score": {"$gte": min_score}}},
-        {"$limit": limit},
+        {"$limit": fetch_limit},
         {
             "$project": {
                 "_id":          0,
@@ -480,9 +478,20 @@ def get_long_term_memories(
         },
     ]
     try:
-        return _json_safe(list(_db.agent_memory.aggregate(pipeline)))
+        results = _json_safe(list(_db.agent_memory.aggregate(pipeline)))
     except Exception as exc:
         return [{"error": f"Long-term memory retrieval failed: {exc}"}]
+
+    if not results:
+        return []
+
+    # Rerank candidates to pick the best limit=N (uses Voyage Rerank if enabled)
+    return _reranker.rerank(
+        query=situation_text,
+        documents=results,
+        text_key="content",
+        top_k=limit,
+    )
 
 
 def write_order_history_sync(
@@ -527,8 +536,9 @@ def write_long_term_memory_sync(
     decided_by: str = "agent", human_decision: str | None = None,
 ) -> None:
     """
-    Generate a natural-language summary of this decision, embed it with
-    Voyage AI, and store it in agent_memory for future vector retrieval.
+    Generate a natural-language summary of this decision, embed it via the
+    configured embedding provider, and store it in agent_memory for future
+    vector retrieval.
     """
     confidence = recommendation.get("confidence", "medium")
     quantity   = recommendation.get("quantity", 0)
@@ -575,8 +585,8 @@ def write_human_decision_memory(order_doc: dict, decision: str) -> None:
     """Persist a human approve/reject decision to both memory layers.
 
     Called from app.py when a human clicks ✅ Approve or ❌ Reject.
-    Runs in a background thread so the UI is not blocked by the Voyage AI
-    embedding call required for the long-term memory entry.
+    Runs in a background thread so the UI is not blocked by the embedding
+    call required for the long-term memory entry.
 
     Short-term memory  — plain insert; picked up by get_short_term_memories
                          on the agent's very next run for this SKU+location.

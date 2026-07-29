@@ -16,13 +16,13 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 
-import voyageai
 from dotenv import load_dotenv
 from bson import ObjectId
 from pymongo import MongoClient, ASCENDING
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from agent.alerts import build_reorder_alert, insert_reorder_alert
+from agent.embeddings import embeddings as _embeddings, EMBEDDING_DIMS
 
 load_dotenv()
 
@@ -37,12 +37,6 @@ db = client["supply_chain_demo"]
 # Grove API gateway (Azure-style api-key auth)
 _GROVE_API_KEY  = os.environ["GROVE_API_KEY"]
 _GROVE_BASE_URL = os.environ["GROVE_API_BASE_URL"]
-
-# Voyage AI embedding client
-voyage_client = voyageai.Client(api_key=os.environ["VOYAGE_API_KEY"])
-
-EMBEDDING_MODEL = "voyage-4-large"
-EMBEDDING_DIMS = 1024
 
 
 # ---------------------------------------------------------------------------
@@ -931,25 +925,12 @@ _SEED_ORDERS: list[dict] = [
 ]
 
 
-def _get_embedding(text: str) -> list:
-    """Embed a text string using Voyage AI voyage-4-large."""
-    result = voyage_client.embed([text], model=EMBEDDING_MODEL, input_type="document")
-    return result.embeddings[0]
-
-
 def _get_embedding_with_retry(text: str, max_retries: int = 3) -> list:
-    """Embed with exponential-backoff retries. Raises on final failure."""
-    for attempt in range(max_retries):
-        try:
-            return _get_embedding(text)
-        except Exception as exc:
-            if attempt < max_retries - 1:
-                wait = 2 ** attempt
-                print(f"\n  [WARN] Embedding failed (attempt {attempt + 1}/{max_retries}): {exc}"
-                      f" — retrying in {wait}s …")
-                time.sleep(wait)
-            else:
-                raise
+    """Embed a document string via the configured embedding provider
+    (agent/embeddings.py). Retries with backoff are handled by the provider
+    itself; max_retries is kept only for backward-compatible call sites.
+    """
+    return _embeddings.embed_documents([text])[0]
 
 
 def _drop_and_recreate_ts(name: str, time_field: str, meta_field: str) -> None:

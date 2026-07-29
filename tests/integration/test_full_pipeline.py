@@ -123,11 +123,9 @@ class TestFullPipeline:
                  patch("agent.graph._db_sync", self.db), \
                  patch("agent.graph._db_async", async_db), \
                  patch("agent.tools._db", self.db), \
-                 patch("agent.tools._voyage") as mock_voyage, \
                  patch("agent.tools._get_embedding", return_value=zero_embed):
 
                 mock_react.ainvoke = AsyncMock(return_value=react_result)
-                mock_voyage.embed.return_value = MagicMock(embeddings=[zero_embed])
 
                 config = {"configurable": {"thread_id": str(self.alert_doc["_id"])}}
                 try:

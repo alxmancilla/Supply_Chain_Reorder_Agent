@@ -62,6 +62,7 @@ except ImportError:  # optional in offline unit-test environments
 from agent import sku_lock
 from agent.db import sync_client as _sync_client, db_sync as _db_sync, db_async as _db_async
 from agent.context_manifest import build_context_manifest
+from agent.embeddings import EMBEDDING_DIMS
 from agent.logger import get_logger
 from agent.order_policy import compute_order_decision
 from agent.alerts import validate_alert_document
@@ -1029,7 +1030,7 @@ async def write_memories(state: AgentState) -> dict:
     │                         │ TTL.  Prevents the agent from re-ordering   │
     │                         │ the same item within the same day.          │
     ├─────────────────────────┼─────────────────────────────────────────────┤
-    │ agent_memory            │ Semantic summary + Voyage AI embedding.     │
+    │ agent_memory            │ Semantic summary + embedding vector.        │
     │                         │ Retrieved later via Atlas Vector Search     │
     │                         │ (`get_learned_patterns` tool).              │
     ├─────────────────────────┼─────────────────────────────────────────────┤
@@ -1082,8 +1083,8 @@ async def write_memories(state: AgentState) -> dict:
             decision_source, human_decision,
         ),
         # ── agent_memory (long-term) ───────────────────────────────────────
-        # Generates a Voyage AI embedding of the decision summary and stores
-        # it in agent_memory.  Retrieved later with $vectorSearch.
+        # Generates an embedding of the decision summary (agent/embeddings.py)
+        # and stores it in agent_memory.  Retrieved later with $vectorSearch.
         # Shows: vector embeddings + Atlas Vector Search round-trip.
         loop.run_in_executor(
             None, write_long_term_memory_sync,
@@ -1578,14 +1579,15 @@ async def _recover_stale_processing_alerts() -> int:
 # ---------------------------------------------------------------------------
 
 #: Expected embedding dimensions for every vector index used by the agent.
-#: Map collection -> index -> expected dimensions. Update this dict whenever
-#: the embedding model or index definition changes.
+#: Map collection -> index -> expected dimensions. Sourced from
+#: agent.embeddings.EMBEDDING_DIMS so a model swap (env var change + reseed)
+#: never drifts out of sync with this preflight check.
 _VECTOR_INDEX_DIMS: dict[str, dict[str, int]] = {
     "order_history": {
-        "order_history_vector_index": 1024,   # voyage-4-large
+        "order_history_vector_index": EMBEDDING_DIMS,
     },
     "agent_memory": {
-        "agent_memory_vector_index": 1024,    # voyage-4-large
+        "agent_memory_vector_index": EMBEDDING_DIMS,
     },
 }
 

@@ -2,7 +2,7 @@
 
 An AI agent that monitors healthcare inventory in real time, detects stockouts, and autonomously drafts purchase orders — with human approval for anything above the auto-approve threshold.
 
-**Stack:** MongoDB Atlas · LangGraph · LangChain · Grove OpenAI-compatible LLM · Voyage AI
+**Stack:** MongoDB Atlas · LangGraph · LangChain · Grove OpenAI-compatible LLM · Voyage AI (embeddings + reranking, both pluggable)
 
 > **Demo project.** All inventory data is simulated. Designed to showcase MongoDB Atlas capabilities in an agentic workflow. Production-hardening sections demonstrate patterns, not a complete production procurement system.
 
@@ -54,8 +54,8 @@ When an order needs review, `save_order` calls `interrupt()` — LangGraph seria
 | Layer | Collection | How it works |
 |---|---|---|
 | **Short-term** (episodic) | `short_term_memory` | One record per decision; TTL 24h. Tags injected into the next prompt: `⚠ HUMAN REJECTED`, `✓ HUMAN APPROVED`, `AUTO-APPROVED`. Also acts as a shared coordination bus between concurrent workers. |
-| **Long-term** (semantic) | `agent_memory` | Natural-language summaries embedded with Voyage AI `voyage-4-large`. Retrieved via `$vectorSearch` (score ≥ 0.72, location pre-filter). `memory_compactor.py` deduplicates (cosine > 0.95) and summarises entries older than 30 days. |
-| **Semantic precedents** | `order_history` | Full order records with Voyage AI embeddings. Retrieved by `find_similar_past_orders` via `$vectorSearch` (score ≥ 0.78, category pre-filter). |
+| **Long-term** (semantic) | `agent_memory` | Natural-language summaries embedded via the configured provider (default: `voyage-4-large`). Retrieved via `$vectorSearch` and optionally refined via the reranking layer. `memory_compactor.py` deduplicates and summarises old entries. |
+| **Semantic precedents** | `order_history` | Historical order archive with vector embeddings. Retrieved by `find_similar_past_orders` via `$vectorSearch` and optionally refined via the reranking layer (see `RERANKER_ENABLED`). |
 | **Procedural** | `procedures` | Rules extracted by `procedure_extractor.py` when the same supplier is approved ≥5× for the same category+location in 30 days. Require human confirmation before the agent uses them. |
 | **Episodic timeline** | `alert_lifecycle` | Full event log per alert: `alert_created → agent_decision → human_approved/rejected → order_placed → stock_recovered`. Surfaced to the agent via `get_episode_history`. |
 
@@ -68,11 +68,11 @@ When an order needs review, `save_order` calls `interrupt()` — LangGraph seria
 | `inventory` | Standard | Current stock positions per SKU + location |
 | `suppliers` | Standard | Approved suppliers with lead times and performance metrics |
 | `consumption_history` | **Time Series** | 90 days of simulated dispensing events; 3 SKUs have a rising trend |
-| `order_history` | Standard | Seeded historical orders with Voyage AI embeddings (Vector Search source) |
+| `order_history` | Standard | Seeded historical orders with embeddings from the configured provider (Vector Search source) |
 | `reorder_alerts` | Standard | Simulator output; triggers the agent via **Change Stream** |
 | `proposed_orders` | Standard | Agent output; human approves/rejects via dashboard (or auto-approved) |
 | `short_term_memory` | Standard + **TTL** | Agent and human decisions per SKU, auto-deleted after 24 h |
-| `agent_memory` | Standard | Long-term semantic summaries of decisions; embedded with Voyage AI |
+| `agent_memory` | Standard | Long-term semantic summaries of decisions; embedded via the configured provider |
 | `checkpoints` | Standard | LangGraph `MongoDBSaver` state snapshots |
 | `alert_lifecycle` | Standard | Full event timeline per alert (created → decision → approval → stock recovery) |
 | `confidence_outcomes` | Standard | Predicted confidence vs actual outcome — powers the Confidence Calibration tab |
@@ -92,7 +92,7 @@ When an order needs review, `save_order` calls `interrupt()` — LangGraph seria
   _or_ Python 3.12+ with a virtual environment
 - [MongoDB Atlas](https://www.mongodb.com/atlas) cluster (M0 free tier works; Atlas Search and Vector Search must be enabled)
 - Grove API key + base URL (OpenAI-compatible gateway; code defaults to `gpt-5.4`)
-- [Voyage AI](https://www.voyageai.com) API key (for `voyage-4-large` embeddings)
+- [Voyage AI](https://www.voyageai.com) API key (default provider for embeddings and, optionally, reranking — see `agent/embeddings.py` and `agent/rerank.py`)
 
 ---
 
@@ -128,7 +128,17 @@ FALLBACK_API_BASE_URL=<alternate-openai-base>
 ESCALATION_WEBHOOK_URL=<webhook-url>
 LOG_LEVEL=INFO
 EXPLAIN_MODE=1           # print plain-English node descriptions (learning/demo aid)
+
+# Optional — override the embedding model/dimensions (see agent/embeddings.py)
+EMBEDDING_MODEL=voyage-4-large
+EMBEDDING_DIMS=1024
+
+# Optional — enable the reranking layer (see agent/rerank.py)
+RERANKER_ENABLED=0
+RERANKER_MODEL=rerank-2
 ```
+
+`agent/embeddings.py` wraps the embedding provider behind LangChain's `Embeddings` interface, and `agent/rerank.py` provides a pluggable reranking layer. Changing models is a configuration change in `.env`. Swapping SDKs (e.g., away from Voyage AI) involves implementing new subclasses in those files. If you change the embedding dimensions, re-run `python data/seed.py` to regenerate the Atlas Vector Search indexes.
 
 ### 3. (Optional) Configure dashboard authentication
 
@@ -148,7 +158,7 @@ If `auth/users.yaml` is absent, the dashboard runs unauthenticated with full adm
 
 ### 4. Seed MongoDB
 
-Run once to create and populate all collections, generate Voyage AI embeddings, and create Atlas Search and Vector Search indexes.
+Run once to create and populate all collections, generate embeddings via the configured provider, and create Atlas Search and Vector Search indexes.
 
 ```bash
 python data/seed.py
@@ -348,7 +358,7 @@ python3 -m pytest tests/ -v
 
 Tests that require a live MongoDB Atlas connection are automatically skipped when the cluster is unreachable (`requires_db` marker). All other tests run without any external dependencies.
 
-Current local baseline in this workspace: `72 passed, 23 skipped` after adding offline graph and alert-helper coverage. Skips are expected when MongoDB Atlas is unreachable; live DB integration tests run when `MONGODB_URI` points to a reachable cluster.
+Current local baseline in this workspace: `97 passed` when `MONGODB_URI` points to a reachable Atlas cluster (includes live DB, integration, and reranking-mock coverage). `requires_db`-marked tests are skipped automatically when Atlas is unreachable.
 
 ```bash
 # Only offline unit tests (no DB, no LLM)
@@ -374,6 +384,7 @@ python3 -m pytest tests/test_coordination/ -v
 | SKU lock | `test_coordination/test_sku_lock.py` | Acquire/release logic, expired-lock cleanup, concurrent exclusivity (real DB) |
 | Offline graph path | `test_nodes/test_graph_offline.py` | Compiles the real topology without MongoDBSaver and verifies zero-gap routing skips recommendation |
 | Alert helpers | `test_tools/test_alert_helpers.py` | Canonical alert shape, lifecycle append, dead-letter behavior |
+| Reranking | `test_tools/test_reranking.py` | `find_similar_past_orders` / `get_long_term_memories` call the configured reranker and respect its ordering/limit |
 | End-to-end pipeline | `integration/test_full_pipeline.py` | Insert alert → graph → assert proposed_order saved (requires MongoDB and graph dependencies) |
 
 ### Coordination tests in detail
@@ -424,6 +435,10 @@ Supply_Chain_Reorder_Agent/
 ├── agent/
 │   ├── graph.py                     # LangGraph multi-agent state machine + Change Stream watcher
 │   ├── tools.py                     # LangChain @tool functions (inventory, suppliers, memory)
+│   ├── embeddings.py                # embedding provider abstraction (swap models/SDKs here)
+│   ├── rerank.py                    # pluggable reranking layer (Voyage Rerank, LLM, etc.)
+│   ├── alerts.py                    # shared reorder-alert build/insert/lifecycle helpers
+│   ├── order_policy.py              # pure order-decision policy (auto-approve, budget, zero-gap)
 │   ├── prompts.py                   # LLM prompt templates
 │   ├── schemas.py                   # Pydantic validation schemas
 │   ├── logger.py                    # structured JSON logger
@@ -433,7 +448,7 @@ Supply_Chain_Reorder_Agent/
 │   ├── memory_compactor.py          # deduplicates and summarises agent_memory
 │   └── memory_retry_worker.py       # retries failed memory writes
 ├── tests/
-│   ├── conftest.py                  # fixtures: test_db, mock LLM, mock Voyage AI
+│   ├── conftest.py                  # fixtures: test_db, mock LLM, mock embedding provider, mock reranker
 │   ├── test_nodes/
 │   │   ├── test_assess_alert.py     # coverage gap + expedite logic
 │   │   ├── test_save_and_notify.py  # production order-policy tests
@@ -445,7 +460,8 @@ Supply_Chain_Reorder_Agent/
 │   │   ├── test_context_manifest.py
 │   │   ├── test_memory_payloads.py
 │   │   ├── test_memory_read_write.py
-│   │   └── test_alert_helpers.py
+│   │   ├── test_alert_helpers.py
+│   │   └── test_reranking.py
 │   ├── test_prompts/
 │   │   ├── test_build_prompt.py
 │   │   └── test_memory_tags.py
@@ -490,7 +506,7 @@ Supply_Chain_Reorder_Agent/
 | **Compound Indexes** | `(sku, location, status)` on `proposed_orders`; `(status, created_at)` on `reorder_alerts`; `(sku, location, decided_at)` on `short_term_memory` |
 | **Atlas Search** | Supplier capability search via `$rankFusion` (two named `$search` sub-pipelines merged via Reciprocal Rank Fusion); falls back to compound `$search` on M0 tier; powers sidebar Supplier Search |
 | **`$rankFusion` / Reciprocal Rank Fusion** | Two independent named `$search` pipelines (`name_match` at 0.4 weight, `capability_match` at 0.6 weight) merged via RRF so a supplier ranking highly in either path rises to the top regardless of raw score scale |
-| **Atlas Vector Search** | Category-filtered search on `order_history`; location-filterable search on `agent_memory` |
+| **Atlas Vector Search** | Category-filtered search on `order_history`; location-filterable search on `agent_memory`; both over-fetch candidates and optionally refine via the pluggable reranking layer (`agent/rerank.py`, `RERANKER_ENABLED`) |
 | **FDA regulatory hard filter** | `recommend` calls `validate_recommendation()` in `agent/tools.py` after each LLM call; pharmaceutical and laboratory SKUs are rejected and retried if the supplier does not have `fda_registered: True`; constraint is also stated in `ANALYSIS_SYSTEM_PROMPT` |
 | **ROP health check** | `app.py` aggregates 30-day average consumption from `consumption_history` and best lead time from `suppliers` in two batch queries; each inventory card shows a ✅ / ⚠️ / 🔴 ROP health indicator; a **📐 ROP Health** KPI card counts at-risk SKUs |
 | **LangGraph MongoDBSaver** | Checkpoints full graph state to `checkpoints` per alert invocation; also the pause-point when `interrupt()` fires — open Atlas during a human-review pause to see the entire agent state frozen in one document |
