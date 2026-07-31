@@ -21,10 +21,13 @@ The simulator writes a reorder alert whenever stock falls below the reorder poin
 | Node | What it does |
 |---|---|
 | `assess_alert` | Reads live inventory; calculates coverage gap and urgency |
-| `route_by_urgency` | Zero-gap alerts skip the LLM; all others go to `recommend` |
-| `recommend` | ReAct loop: queries Atlas Search, Vector Search, time-series trend, and memory — then calls the configured Grove-hosted model to pick a supplier, quantity, and rationale |
+| `route_by_urgency` | Zero-gap alerts skip the LLM; all others start the recommendation flow |
+| `retrieve_context` | ReAct loop: queries Atlas Search, Vector Search, time-series trend, and memory layers |
+| `analyze_suppliers` | Ranks suppliers by fill rate, lead time, FDA compliance, and cost |
+| `draft_recommendation` | Calculates order quantity and selects best supplier |
 | `save_order` | Writes the order. **Auto-approves** if confidence is `high` and cost < $5,000; otherwise pauses for human review via LangGraph `interrupt()` |
 | `write_memories` | Persists the decision to short-term memory (TTL 24h), long-term semantic memory, and order history |
+| `escalate` | Writes an escalation record if the agent cannot produce a valid recommendation |
 
 Full diagrams: [diagrams/agent_diagrams.md](diagrams/agent_diagrams.md)
 

@@ -33,8 +33,8 @@ def test_zero_gap_graph_path_skips_recommend(monkeypatch):
             "expedite": False,
         }
 
-    async def fake_recommend(state):
-        raise AssertionError("recommend should be skipped for zero-gap alerts")
+    async def fake_retrieve(state):
+        raise AssertionError("retrieve_context should be skipped for zero-gap alerts")
 
     async def fake_save_order(state):
         events.append("save_order")
@@ -52,7 +52,7 @@ def test_zero_gap_graph_path_skips_recommend(monkeypatch):
         return {}
 
     monkeypatch.setattr(graph_module, "assess_alert", fake_assess)
-    monkeypatch.setattr(graph_module, "recommend", fake_recommend)
+    monkeypatch.setattr(graph_module, "retrieve_context", fake_retrieve)
     monkeypatch.setattr(graph_module, "save_order", fake_save_order)
     monkeypatch.setattr(graph_module, "write_memories", fake_write_memories)
 

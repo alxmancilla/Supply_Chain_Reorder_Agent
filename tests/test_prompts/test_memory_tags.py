@@ -33,8 +33,9 @@ class TestMemoryTags:
                 "reasoning_trace":    "Good fit.",
             },
             "recommendation": {},
-            "audit_result": {"valid": False, "errors": []},
-            "audit_retries": 0,
+            "retry_count": 0,
+            "prior_errors": [],
+            "escalate_flag": False,
         }
 
     def test_human_approved_tag_present(self):

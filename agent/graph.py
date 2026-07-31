@@ -1,29 +1,34 @@
 """
 LangGraph agent — supply chain reorder pipeline.
 
-Graph topology (5 nodes):
+Graph topology (8 nodes):
     START
-      → assess_alert     (DB-only: inventory position + coverage gap)
-      → route_by_urgency (conditional: zero-gap fast path vs recommend)
-          ↘ save_order   (zero-gap fast path — no LLM needed)
-          ↘ recommend    (retrieval + analysis + recommendation + validation)
-              → save_order  (write order; interrupt() for human review)
-                  → write_memories  (short-term, long-term, history)
-      → escalate         (validation failed — writes escalation record)
+      → assess_alert        (DB-only: inventory position + coverage gap)
+      → route_by_urgency    (conditional: zero-gap fast path vs recommendation flow)
+          ↘ save_order      (zero-gap fast path — no LLM needed)
+          ↘ retrieve_context (ReAct tool loop → gather context)
+              → analyze_suppliers   (LLM-based supplier ranking)
+                  → draft_recommendation (LLM-based quantity/rationale)
+                      ↘ handle_retry (loop back on validation failure)
+                      ↘ escalate     (validation exhausted)
+                      ↘ save_order   (valid recommendation)
+                          → write_memories (short-term, long-term, history)
       → END
 
 Node responsibilities:
-  assess_alert   — read MongoDB, compute coverage gap
-  recommend      — ReAct tool loop → LLM analysis → LLM recommendation → validate
-  save_order     — write proposed_order; interrupt() for human review
-  write_memories — persist decision to all three memory layers
-  escalate       — write escalation record if recommend cannot produce a valid order
+  assess_alert         — read MongoDB, compute coverage gap
+  retrieve_context     — ReAct tool loop (suppliers, trends, memory)
+  analyze_suppliers    — rank suppliers by fill rate, lead time, compliance
+  draft_recommendation — calculate quantity, select best supplier, write rationale
+  save_order           — write proposed_order; interrupt() for human review
+  write_memories       — persist decision to all three memory layers
+  escalate             — write escalation record if validation fails
 
 Explain mode (EXPLAIN_MODE=1):
   Each node prints a plain-English description of what it is doing.
   Useful for learning and live demos without reading JSON logs.
 
-ReAct retrieval tools (called inside recommend):
+ReAct retrieval tools (called inside retrieve_context):
   1. get_inventory_position           (basic find)
   2. get_supplier_options             (basic find, fill-rate sorted)
   3. get_consumption_trend            (time series aggregation)
@@ -361,7 +366,7 @@ class AgentState(TypedDict):
     coverage_gap:            int    # Units still needed to reach the reorder point
     expedite:                bool   # True when days_of_stock_remaining < 2
 
-    # ── Retrieval fields (populated by recommend node) ───────────────────
+    # ── Retrieval fields (populated by retrieve_context node) ────────────
     suppliers:               list   # get_supplier_options result
     consumption:             dict   # get_consumption_trend result
     supplier_search_results: list   # Atlas Search result
@@ -372,10 +377,11 @@ class AgentState(TypedDict):
     retrieval_trace:         list   # Ordered list of {tool, args} dicts
     context_budget_report:   dict   # Token budget report for recommendation context
 
-    # ── Recommend fields (populated by recommend node) ────────────────────
+    # ── Recommend fields (populated by recommend nodes) ────────────────────
     analysis:                dict   # {best_supplier_id, confidence, risk_flags, reasoning_trace}
     recommendation:          dict   # {supplier_id, supplier_name, quantity, rationale, confidence}
-    escalate_flag:           bool   # True when recommend exhausts retries — routes to escalate
+    retry_count:             int    # Number of validation retries for recommendation
+    prior_errors:            list   # Validation errors from the previous attempt
 
     # ── Persistence fields (populated by save_order / write_memories) ────────
     order_id:             str    # _id of the saved proposed_order
@@ -449,35 +455,20 @@ async def assess_alert(state: AgentState) -> AgentState:
         "existing_order_qty": existing_order_qty,
         "coverage_gap":       coverage_gap,
         "expedite":           expedite,
+        "retry_count":        0,
+        "prior_errors":       [],
     }
 
 
 # ---------------------------------------------------------------------------
-# Node 2: recommend — retrieval → analysis → recommendation → validation
-# ---------------------------------------------------------------------------
-#
-# Retrieval, analysis, recommendation, and validation are merged here so beginners
-# see a single, readable step:
-#   Step 1 — ReAct tool-calling loop (gather suppliers, trends, memory)
-#   Step 2 — LLM analysis            (rank suppliers, assign confidence)
-#   Step 3 — LLM recommendation      (calculate quantity, write rationale)
-#   Step 4 — Inline validation        (Pydantic rules + FDA compliance; retries internally)
+# Node 2: Recommendation flow (Partial split into 3 nodes)
 # ---------------------------------------------------------------------------
 
-async def recommend(state: AgentState) -> dict:
-    """Retrieval → Analysis → Recommendation → Validation in a single node.
+async def retrieve_context(state: AgentState) -> dict:
+    """Step 1 — ReAct tool-calling loop (gather suppliers, trends, memory).
 
-    Step 1 — ReAct tool-calling loop
-        The LLM decides which tools to call (Atlas Search, Vector Search,
-        time series, memory) until it has enough context.
-    Step 2 — LLM analysis
-        Rank suppliers by fill rate, lead time, FDA compliance, and cost.
-        Assign a confidence score: high / medium / low.
-    Step 3 — LLM recommendation
-        Calculate order quantity, select the best supplier, write rationale.
-    Step 4 — Inline validation
-        Pydantic schema check + FDA / budget rules.  Retries internally
-        (up to _MAX_JSON_RETRIES times) before escalating.
+    Resilience: If the ReAct loop fails or misses essential tools, deterministic
+    fallbacks ensure we still have the minimum data for analysis.
     """
     alert     = state["alert"]
     inventory = state.get("inventory", {})
@@ -487,11 +478,9 @@ async def recommend(state: AgentState) -> dict:
 
     urgency_label = "CRITICAL" if days < 2 else "ELEVATED" if days < 5 else "STANDARD"
 
-    # ── Step 1: Retrieval (ReAct tool-calling loop) ──────────────────────────
     _explain(
-        f"[recommend] Step 1/3 — ReAct retrieval for {alert['sku']} (urgency={urgency_label}). "
-        "The LLM picks tools: supplier search (Atlas Search), similar orders (Vector Search), "
-        "consumption trend, short-term and long-term memory."
+        f"[retrieve_context] ReAct retrieval for {alert['sku']} (urgency={urgency_label}). "
+        "The LLM picks tools: supplier search, similar orders, consumption trend, memory."
     )
 
     context = (
@@ -516,10 +505,11 @@ async def recommend(state: AgentState) -> dict:
         retrieval_results, retrieval_trace = _extract_retrieval_results(result["messages"])
     except Exception as exc:
         log.warning("ReAct agent failed, falling back to direct calls", extra={
-            "phase": "recommend", "sku": alert.get("sku"), "error": str(exc),
+            "phase": "retrieve_context", "sku": alert.get("sku"), "error": str(exc),
         })
         retrieval_results, retrieval_trace = {}, []
 
+    # ── Deterministic fallbacks for essential context ────────────────────────
     suppliers = retrieval_results.get("get_supplier_options", [])
     if not suppliers or (len(suppliers) == 1 and "error" in suppliers[0]):
         suppliers = get_supplier_options.invoke({"sku": alert["sku"]})
@@ -544,29 +534,21 @@ async def recommend(state: AgentState) -> dict:
             or m.get("location") in (None, alert["location"])
         ]
     else:
-        long_term_mems = get_long_term_memories(
-            context,
-            location=alert["location"],
-        )
+        long_term_mems = get_long_term_memories(context, location=alert["location"])
 
     def _count(results: list) -> int:
         return len([r for r in results if "error" not in r and "info" not in r])
 
     _explain(
-        f"[recommend] Retrieval done — {len(retrieval_trace)} tool call(s). "
-        f"{len(suppliers)} suppliers · {_count(similar_orders)} similar past orders "
-        f"· trend={consumption.get('trend', '?')}."
+        f"[retrieve_context] Done — {len(retrieval_trace)} tool call(s). "
+        f"{len(suppliers)} suppliers · {_count(similar_orders)} similar past orders."
     )
     log.info("retrieval complete", extra={
-        "phase": "recommend", "sku": alert["sku"], "location": alert.get("location"),
+        "phase": "retrieve_context", "sku": alert["sku"], "location": alert.get("location"),
         "tool_calls": len(retrieval_trace), "suppliers": len(suppliers),
-        "avg_daily": consumption.get("avg_daily"), "trend": consumption.get("trend", "?"),
-        "atlas_hits": _count(supplier_search), "vector_hits": _count(similar_orders),
     })
 
-    # Build a local context dict for prompt builders (not written to state yet)
-    ctx = {
-        **state,
+    return {
         "suppliers":               suppliers,
         "consumption":             consumption,
         "supplier_search_results": supplier_search,
@@ -577,15 +559,18 @@ async def recommend(state: AgentState) -> dict:
         "retrieval_trace":         retrieval_trace,
     }
 
-    # ── Step 2: Analysis ─────────────────────────────────────────────────────
+async def analyze_suppliers(state: AgentState) -> dict:
+    """Step 2 — LLM analysis (rank suppliers, assign confidence)."""
+    suppliers = state.get("suppliers", [])
+
     _explain(
-        f"[recommend] Step 2/3 — LLM evaluating {len(suppliers)} supplier(s): "
+        f"[analyze_suppliers] Evaluating {len(suppliers)} supplier(s): "
         "fill rate · lead time · FDA compliance · cost → confidence score."
     )
 
     analysis_messages = [
         {"role": "system", "content": ANALYSIS_SYSTEM_PROMPT},
-        {"role": "user",   "content": build_analysis_prompt(ctx)},
+        {"role": "user",   "content": build_analysis_prompt(state)},
     ]
     analysis = None
     for attempt in range(_MAX_JSON_RETRIES):
@@ -603,81 +588,59 @@ async def recommend(state: AgentState) -> dict:
                 raise ValueError(f"Analysis returned invalid JSON after {_MAX_JSON_RETRIES} attempts: {exc}") from exc
 
     _explain(
-        f"[recommend] Best supplier: {analysis.get('best_supplier_name', '?')}, "
-        f"confidence={analysis.get('confidence', '?')}. "
-        f"Risk flags: {analysis.get('risk_flags', []) or 'none'}."
+        f"[analyze_suppliers] Best supplier: {analysis.get('best_supplier_name', '?')}, "
+        f"confidence={analysis.get('confidence', '?')}."
     )
-    ctx = {**ctx, "analysis": analysis}
+    return {"analysis": analysis}
 
-    # ── Step 3: Recommendation + inline validation ───────────────────────────
-    _explain("[recommend] Step 3/3 — LLM calculating order quantity and writing rationale.")
+async def draft_recommendation(state: AgentState) -> dict:
+    """Step 3 — LLM recommendation (calculate quantity, write rationale)."""
+    prior_errors = state.get("prior_errors", [])
 
-    recommendation: dict = {}
-    prior_errors: list[str] = []
-    escalate_flag = False
-    context_budget_report: dict = {}
+    _explain(f"[draft_recommendation] Calculating order quantity and writing rationale.")
 
-    for attempt in range(_MAX_JSON_RETRIES):
-        prompt_state = {**ctx, "audit_result": {"errors": prior_errors}}
-        rec_prompt = build_recommendation_prompt(prompt_state)
-        context_budget_report = prompt_state.get("_context_budget_report", context_budget_report)
-        if prior_errors:
-            rec_prompt += (
-                "\n\nPREVIOUS VALIDATION ERRORS — fix all of these:\n"
-                + "\n".join(f"  - {e}" for e in prior_errors)
-            )
-        rec_messages = [
-            {"role": "system", "content": RECOMMENDATION_SYSTEM_PROMPT},
-            {"role": "user",   "content": rec_prompt},
-        ]
-        for json_attempt in range(_MAX_JSON_RETRIES):
-            response = await _llm_invoke(rec_messages)
-            try:
-                recommendation = _parse_llm_json(response.content)
-                break
-            except json.JSONDecodeError as exc:
-                if json_attempt < _MAX_JSON_RETRIES - 1:
-                    rec_messages += [
-                        {"role": "assistant", "content": response.content},
-                        {"role": "user",      "content": f"{_JSON_STRIP_FIX}\nError: {exc}"},
-                    ]
-                else:
-                    raise ValueError(f"Recommendation returned invalid JSON: {exc}") from exc
+    rec_prompt = build_recommendation_prompt(state)
 
-        errors = validate_recommendation(recommendation, ctx)
-        if not errors:
-            _explain(f"[recommend] ✅ Validation passed — handing off to save_order.")
+    if prior_errors:
+        rec_prompt += (
+            "\n\nPREVIOUS VALIDATION ERRORS — fix all of these:\n"
+            + "\n".join(f"  - {e}" for e in prior_errors)
+        )
+
+    rec_messages = [
+        {"role": "system", "content": RECOMMENDATION_SYSTEM_PROMPT},
+        {"role": "user",   "content": rec_prompt},
+    ]
+
+    recommendation = {}
+    for json_attempt in range(_MAX_JSON_RETRIES):
+        response = await _llm_invoke(rec_messages)
+        try:
+            recommendation = _parse_llm_json(response.content)
             break
-        prior_errors = errors
-        _explain(f"[recommend] ❌ Validation failed ({len(errors)} error(s)): {errors}. "
-                 + ("Escalating." if attempt + 1 >= _MAX_JSON_RETRIES else "Retrying …"))
-        log.warning("validation failed", extra={
-            "phase": "recommend", "sku": alert["sku"], "attempt": attempt + 1, "errors": errors,
-        })
-        if attempt + 1 >= _MAX_JSON_RETRIES:
-            escalate_flag = True
+        except json.JSONDecodeError as exc:
+            if json_attempt < _MAX_JSON_RETRIES - 1:
+                rec_messages += [
+                    {"role": "assistant", "content": response.content},
+                    {"role": "user",      "content": f"{_JSON_STRIP_FIX}\nError: {exc}"},
+                ]
+            else:
+                raise ValueError(f"Recommendation returned invalid JSON: {exc}") from exc
 
-    log.info("recommend complete", extra={
-        "phase": "recommend", "sku": alert["sku"], "location": alert.get("location"),
-        "supplier": recommendation.get("supplier_name"),
-        "quantity": recommendation.get("quantity"),
-        "confidence": recommendation.get("confidence"),
-        "escalate": escalate_flag,
-    })
+    context_budget_report = state.get("_context_budget_report", {})
 
     return {
-        "suppliers":               suppliers,
-        "consumption":             consumption,
-        "supplier_search_results": supplier_search,
-        "similar_orders":          similar_orders,
-        "short_term_memories":     short_term_mems,
-        "long_term_memories":      long_term_mems,
-        "retrieval_results":       retrieval_results,
-        "retrieval_trace":         retrieval_trace,
-        "context_budget_report":   context_budget_report,
-        "analysis":                analysis,
-        "recommendation":          recommendation,
-        "escalate_flag":           escalate_flag,
+        "recommendation": recommendation,
+        "context_budget_report": context_budget_report,
+    }
+
+def handle_retry(state: AgentState) -> dict:
+    """Increment retry counter and store errors for the next drafting attempt."""
+    recommendation = state.get("recommendation", {})
+    errors = validate_recommendation(recommendation, state)
+    return {
+        "retry_count": state.get("retry_count", 0) + 1,
+        "prior_errors": errors,
     }
 
 
@@ -1180,7 +1143,7 @@ async def _notify_escalation_webhook(url: str, sku: str, alert: dict, reason: st
 
 
 async def escalate_alert(state: AgentState) -> AgentState:
-    """Write an escalation record when recommend exhausts all validation retries.
+    """Write an escalation record when the draft_recommendation flow exhausts all retries.
 
     Writes to escalation_queue, marks the alert as 'escalated', and
     optionally POSTs a webhook notification.
@@ -1190,7 +1153,7 @@ async def escalate_alert(state: AgentState) -> AgentState:
     reason = "validation_max_retries"
 
     _explain(
-        f"[escalate_alert] ⚠️  Escalating {sku} — the recommend node failed validation "
+        f"[escalate_alert] ⚠️  Escalating {sku} — the recommendation flow failed validation "
         "after all retries without producing a valid order. "
         "Writing to escalation_queue so a human specialist can investigate."
     )
@@ -1251,30 +1214,45 @@ def route_by_urgency(state: AgentState) -> str:
     """
     if state.get("coverage_gap") == 0:
         return "save_order"
-    return "recommend"
+    return "retrieve_context"
 
 
-def route_after_recommend(state: AgentState) -> str:
-    """Route after recommend: escalate if validation failed, otherwise save."""
-    if state.get("escalate_flag"):
-        log.warning("recommend exhausted retries, escalating", extra={
-            "phase": "recommend", "sku": state["alert"]["sku"],
+def route_after_draft(state: AgentState) -> str:
+    """Validate recommendation and decide whether to save, retry, or escalate."""
+    recommendation = state.get("recommendation", {})
+    alert          = state["alert"]
+    retry_count    = state.get("retry_count", 0)
+
+    # Use the shared validation logic from agent/tools.py
+    errors = validate_recommendation(recommendation, state)
+
+    if not errors:
+        return "save_order"
+
+    if retry_count + 1 >= _MAX_JSON_RETRIES:
+        log.warning("recommendation flow exhausted retries, escalating", extra={
+            "phase": "draft_recommendation", "sku": alert["sku"], "errors": errors,
         })
         return "escalate"
-    return "save_order"
+
+    return "retry"
 
 
 # ---------------------------------------------------------------------------
-# Graph construction — 5-node topology
+# ---------------------------------------------------------------------------
+# Graph construction — 8-node topology
 # ---------------------------------------------------------------------------
 #
 #   START
 #     → assess_alert
-#         ↘ save_order  (zero-gap fast path — no LLM needed)
-#         ↘ recommend   (retrieval + analysis + recommendation + validation)
-#               ↘ escalate    (validation exhausted)
-#               ↘ save_order  (valid recommendation)
-#                   → write_memories
+#         ↘ save_order       (zero-gap fast path)
+#         ↘ retrieve_context (ReAct loop)
+#             → analyze_suppliers
+#                 → draft_recommendation
+#                     ↘ handle_retry (loop back to draft)
+#                     ↘ escalate     (validation exhausted)
+#                     ↘ save_order   (valid recommendation)
+#                         → write_memories
 #     → END
 #
 # ---------------------------------------------------------------------------
@@ -1282,23 +1260,34 @@ def route_after_recommend(state: AgentState) -> str:
 def build_graph(checkpointer_required: bool = True):
     builder = StateGraph(AgentState)
 
-    builder.add_node("assess_alert",   assess_alert)
-    builder.add_node("recommend",      recommend)
-    builder.add_node("escalate",       escalate_alert)
-    builder.add_node("save_order",     save_order)
-    builder.add_node("write_memories", write_memories)
+    builder.add_node("assess_alert",         assess_alert)
+    builder.add_node("retrieve_context",     retrieve_context)
+    builder.add_node("analyze_suppliers",    analyze_suppliers)
+    builder.add_node("draft_recommendation", draft_recommendation)
+    builder.add_node("handle_retry",         handle_retry)
+    builder.add_node("escalate",             escalate_alert)
+    builder.add_node("save_order",           save_order)
+    builder.add_node("write_memories",       write_memories)
 
     builder.add_edge(START, "assess_alert")
     builder.add_conditional_edges(
         "assess_alert",
         route_by_urgency,
-        {"save_order": "save_order", "recommend": "recommend"},
+        {"save_order": "save_order", "retrieve_context": "retrieve_context"},
     )
+    builder.add_edge("retrieve_context",  "analyze_suppliers")
+    builder.add_edge("analyze_suppliers", "draft_recommendation")
+
     builder.add_conditional_edges(
-        "recommend",
-        route_after_recommend,
-        {"save_order": "save_order", "escalate": "escalate"},
+        "draft_recommendation",
+        route_after_draft,
+        {
+            "save_order": "save_order",
+            "retry":      "handle_retry",
+            "escalate":   "escalate",
+        },
     )
+    builder.add_edge("handle_retry",   "draft_recommendation")
     builder.add_edge("escalate",       END)
     builder.add_edge("save_order",     "write_memories")
     builder.add_edge("write_memories", END)

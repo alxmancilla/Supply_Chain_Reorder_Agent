@@ -271,7 +271,8 @@ def sample_state(sample_alert, sample_inventory, sample_suppliers):
             "rationale":     "Stock is critically low; ordering 500 units to restore coverage.",
             "confidence":    "high",
         },
-        "audit_result":            {"valid": True, "errors": []},
-        "audit_retries":           0,
+        "retry_count":             0,
+        "prior_errors":            [],
+        "escalate_flag":           False,
         "expedite":                True,
     }
